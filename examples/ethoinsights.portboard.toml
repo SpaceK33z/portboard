@@ -1,0 +1,7 @@
+version = 1
+
+[[launch_targets]]
+id = "dev-full"
+label = "Full dev stack"
+argv = ["pnpm", "dev:full"]
+process_match = ["scripts/dev-full.mjs"]

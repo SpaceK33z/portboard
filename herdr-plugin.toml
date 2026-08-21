@@ -1,0 +1,23 @@
+id = "portboard"
+name = "Portboard"
+version = "0.1.0"
+min_herdr_version = "0.7.4"
+description = "Inspect, open, and start development processes for the current workspace."
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[actions]]
+id = "open"
+title = "Portboard: current workspace"
+contexts = ["workspace"]
+command = ["./target/release/portboard", "plugin-open"]
+
+[[panes]]
+id = "current"
+title = "Portboard"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["bash", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/portboard\" panel"]
