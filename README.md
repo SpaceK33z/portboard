@@ -51,7 +51,7 @@ process_match = ["scripts/dev_worker.py"]
 
 `argv` is an argument vector, not a shell command. Portboard runs it from the selected worktree root.
 
-`process_match` identifies a manually started or already-running process. Every value must occur in the process command line, and the process cwd must be inside the current worktree. When `process_match` is omitted, every `argv` value is used as the signature. Choose a signature that remains present in the long-lived process command line; this is what prevents duplicate starts.
+`process_match` identifies a manually started or already-running process. Every value must match one argument exactly or as a path suffix, and the process cwd must be inside the current worktree. Matching arguments individually prevents a shell command that merely mentions a target signature from being mistaken for the target. When `process_match` is omitted, every `argv` value is used as the signature. Choose a signature that remains present in the long-lived process argument vector; this is what prevents duplicate starts.
 
 `runtime_file` is an optional relative path inside the worktree. Portboard accepts its contents only when its `pid` is one of the target's revalidated matching processes. The project writes this control-plane JSON:
 
@@ -247,6 +247,14 @@ Presentations
 - Rust 1.87 or newer when building from source
 - `fzf` 0.71 or newer for the Herdr popup
 - Optional: Herdr 0.7.4 or newer
+
+## Alternatives
+
+- [herdr-vitals](https://github.com/ericcparsons/herdr-vitals)
+- [herdr-switchboard](https://github.com/crafts69guy/herdr-switchboard)
+- [herdr-portfwd](https://github.com/miko-misa/herdr-portfwd)
+- [herdr-browser](https://github.com/ogulcancelik/herdr-browser)
+- [herdr-devup](https://github.com/alon-z/herdr-devup)
 
 ## License
 
