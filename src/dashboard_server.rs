@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::net::ToSocketAddrs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -22,6 +22,9 @@ use crate::manifest_approval::{
 use crate::state_paths::worktree_state_directory;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:9777";
+
+/// How many timestamped run logs are retained per launch target.
+const LOGS_TO_KEEP: usize = 5;
 
 /// Runs the current-worktree dashboard and JSON API on a loopback address.
 pub fn serve_worktree_dashboard(worktree_root: &Path, bind_address: Option<&str>) -> Result<()> {
@@ -105,8 +108,9 @@ fn handle_request(
             (Method::Get, "/api/status") => {
                 let config = load_worktree_launch_targets(&state.worktree_root)?;
                 let manifest = current_manifest_snapshot(&state.worktree_root, &config)?;
-                let statuses = inspect_worktree_launch_targets(&state.worktree_root, &config)?;
-                let targets = statuses
+                let inspection = inspect_worktree_launch_targets(&state.worktree_root, &config)?;
+                let targets = inspection
+                    .statuses
                     .iter()
                     .zip(config.launch_targets.iter())
                     .map(|(status, target)| {
@@ -123,6 +127,7 @@ fn handle_request(
                 let status = DashboardStatus {
                     worktree_root: state.worktree_root.to_string_lossy().into_owned(),
                     manifest: &manifest,
+                    findings: &inspection.findings,
                     targets,
                 };
                 Ok((
@@ -314,10 +319,7 @@ impl DashboardState {
             bail!("Portboard launch target `{target_id}` needs approval before it can start");
         }
 
-        let log_path = self
-            .log_directory
-            .join(format!("{}.log", target.id.as_str()));
-        let log = open_log(&log_path)?;
+        let (log_path, log) = rotate_log(&self.log_directory, target.id.as_str())?;
         let stderr = log.try_clone().with_context(|| {
             format!("Portboard dashboard could not clone {}", log_path.display())
         })?;
@@ -407,17 +409,87 @@ fn detached_command(target: &LaunchTarget, worktree_root: &Path) -> Command {
     command
 }
 
+/// Creates a fresh timestamped log file, repoints the stable `{id}.log`
+/// symlink at it, and prunes older runs beyond [`LOGS_TO_KEEP`].
+fn rotate_log(log_directory: &Path, target_id: &str) -> Result<(PathBuf, File)> {
+    let mut stamp = unix_time_millis();
+    let log_path = loop {
+        let candidate = log_directory.join(format!("{target_id}.{stamp}.log"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        stamp += 1;
+    };
+    let log = open_log(&log_path)?;
+    let link_path = log_directory.join(format!("{target_id}.log"));
+    let _ = fs::remove_file(&link_path);
+    symlink(
+        log_path.file_name().with_context(|| {
+            format!("Portboard dashboard could not name {}", log_path.display())
+        })?,
+        &link_path,
+    )
+    .with_context(|| format!("Portboard dashboard could not link {}", link_path.display()))?;
+    prune_old_logs(log_directory, target_id, LOGS_TO_KEEP)?;
+    Ok((log_path, log))
+}
+
 fn open_log(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
-        .truncate(true)
-        .write(true)
+        .append(true)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("Portboard dashboard could not open {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("Portboard dashboard could not secure {}", path.display()))?;
     Ok(file)
+}
+
+/// Returns milliseconds since the Unix epoch for timestamped log names.
+fn unix_time_millis() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default()
+}
+
+/// Collects the numeric stamps of one target's timestamped run logs.
+fn timestamped_log_stamps(log_directory: &Path, target_id: &str) -> Result<Vec<u64>> {
+    let prefix = format!("{target_id}.");
+    let mut stamps = fs::read_dir(log_directory)
+        .with_context(|| {
+            format!(
+                "Portboard dashboard could not read {}",
+                log_directory.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let stamp = name.strip_prefix(&prefix)?.strip_suffix(".log")?;
+            stamp.parse::<u64>().ok()
+        })
+        .collect::<Vec<_>>();
+    stamps.sort_unstable();
+    stamps.dedup();
+    Ok(stamps)
+}
+
+/// Removes the oldest timestamped run logs so only the newest `keep` remain.
+fn prune_old_logs(log_directory: &Path, target_id: &str, keep: usize) -> Result<()> {
+    let prefix = format!("{target_id}.");
+    let stamps = timestamped_log_stamps(log_directory, target_id)?;
+    let cutoff = stamps.len().saturating_sub(keep);
+    for stamp in &stamps[..cutoff] {
+        let path = log_directory.join(format!("{prefix}{stamp}.log"));
+        fs::remove_file(&path)
+            .with_context(|| format!("Portboard dashboard could not prune {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn find_target<'a>(targets: &'a [LaunchTarget], target_id: &str) -> Result<&'a LaunchTarget> {
@@ -460,6 +532,7 @@ struct ApprovalRequest {
 struct DashboardStatus<'a> {
     worktree_root: String,
     manifest: &'a str,
+    findings: &'a [String],
     targets: Vec<DashboardTargetStatus<'a>>,
 }
 
@@ -528,8 +601,16 @@ async function refresh() {{
       const row = document.createElement('section'); row.className = 'target';
       const label = document.createElement('strong'); label.textContent = target.label;
       const state = document.createElement('span'); state.className = 'state';
-      const ports = target.endpoints.map(endpoint => `${{endpoint.address}}:${{endpoint.port}}`).join(', ');
-      state.textContent = ports ? `${{target.state}} · ${{ports}}` : target.state;
+      const endpoints = target.named_endpoints.length
+        ? target.named_endpoints.map(endpoint => `${{endpoint.id}} ${{endpoint.url}}`).join(', ')
+        : target.endpoints.map(endpoint => `${{endpoint.address}}:${{endpoint.port}}`).join(', ');
+      const detail = endpoints ? `${{target.state}} · ${{endpoints}}` : target.state;
+      if (target.duplicate) {{
+        state.style.color = '#ff8f8f';
+        state.textContent = `duplicate! (${{detail}})`;
+      }} else {{
+        state.textContent = detail;
+      }}
       const button = document.createElement('button');
       const running = target.state === 'running';
       button.textContent = running ? 'Stop' : 'Start';
@@ -558,7 +639,10 @@ refresh(); setInterval(refresh, 2000);
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_bind_address;
+    use std::fs;
+    use std::path::Path;
+
+    use super::{is_loopback_bind_address, rotate_log};
 
     #[test]
     fn only_accepts_loopback_dashboard_addresses() {
@@ -573,5 +657,45 @@ mod tests {
         for address in ["0.0.0.0:9777", "192.168.1.10:9777", "192.0.2.1:9777"] {
             assert!(!is_loopback_bind_address(address), "{address}");
         }
+    }
+
+    #[test]
+    fn rotates_logs_and_prunes_older_runs() {
+        let directory = tempfile::tempdir().expect("temporary log directory");
+        for stamp in 1..=7_u64 {
+            fs::write(
+                directory.path().join(format!("probe.{stamp}.log")),
+                format!("run {stamp}\n"),
+            )
+            .expect("seed log");
+        }
+
+        let (current, _) = rotate_log(directory.path(), "probe").expect("rotated log");
+
+        // The stable symlink points at the newest timestamped file.
+        let link = directory.path().join("probe.log");
+        assert_eq!(
+            fs::read_link(&link).expect("current log symlink"),
+            Path::new(current.file_name().expect("timestamped name"))
+        );
+        assert_eq!(fs::read_to_string(&link).expect("linked contents"), "");
+
+        // Only LOGS_TO_KEEP timestamped logs remain, and they are the newest.
+        let remaining = fs::read_dir(directory.path())
+            .expect("log directory")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("probe.") && name != "probe.log")
+            })
+            .count();
+        assert_eq!(remaining, 5);
+        assert!(!directory.path().join("probe.1.log").exists());
+        assert!(!directory.path().join("probe.2.log").exists());
+        assert!(!directory.path().join("probe.3.log").exists());
+        assert!(directory.path().join("probe.7.log").exists());
+        assert!(current.exists());
     }
 }

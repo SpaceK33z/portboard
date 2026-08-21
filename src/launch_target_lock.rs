@@ -45,6 +45,75 @@ impl LaunchTargetLock {
     /// Returns true while a previously launched root process has the same PID
     /// and Linux start time. Stale reservations are removed while locked.
     pub fn has_active_reservation(&mut self) -> Result<bool> {
+        Ok(self.active_reservation()?.is_some())
+    }
+
+    /// Returns the reserved launcher PID while its Linux process identity matches.
+    pub fn active_reservation_pid(&mut self) -> Result<Option<u32>> {
+        Ok(self.active_reservation()?.map(|(pid, _)| pid))
+    }
+
+    /// Sends SIGTERM to the exact reserved launcher process and clears the reservation.
+    pub fn cancel_active_reservation(&mut self) -> Result<Option<u32>> {
+        let Some((pid, expected_start_time)) = self.active_reservation()? else {
+            return Ok(None);
+        };
+        // SAFETY: pidfd_open consumes only the numeric PID and returns a new descriptor.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
+        if descriptor >= 0 {
+            if process_start_time(pid) != Some(expected_start_time) {
+                // SAFETY: this branch owns the descriptor returned above.
+                unsafe {
+                    libc::close(descriptor as i32);
+                }
+                self.clear()?;
+                return Ok(None);
+            }
+            // SAFETY: pidfd_send_signal uses the owned descriptor and no siginfo pointer.
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    descriptor as i32,
+                    libc::SIGTERM,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            let error = io::Error::last_os_error();
+            // SAFETY: this branch owns the descriptor returned above.
+            unsafe {
+                libc::close(descriptor as i32);
+            }
+            if result != 0 && error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).with_context(|| {
+                    format!("Portboard could not cancel reserved launcher pid {pid}")
+                });
+            }
+        } else {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+                return Err(error).with_context(|| {
+                    format!("Portboard could not open reserved launcher pid {pid}")
+                });
+            }
+            if process_start_time(pid) == Some(expected_start_time) {
+                // SAFETY: the PID and start time were revalidated immediately above.
+                let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                if result != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error).with_context(|| {
+                            format!("Portboard could not cancel reserved launcher pid {pid}")
+                        });
+                    }
+                }
+            }
+        }
+        self.clear()?;
+        Ok(Some(pid))
+    }
+
+    fn active_reservation(&mut self) -> Result<Option<(u32, u64)>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut contents = String::new();
         self.file.read_to_string(&mut contents)?;
@@ -54,10 +123,10 @@ impl LaunchTargetLock {
                 start_time.trim().parse::<u64>().ok()?,
             ))
         });
-        let active = reservation.is_some_and(|(pid, expected_start_time)| {
-            process_start_time(pid) == Some(expected_start_time)
+        let active = reservation.filter(|(pid, expected_start_time)| {
+            process_start_time(*pid) == Some(*expected_start_time)
         });
-        if !active && !contents.is_empty() {
+        if active.is_none() && !contents.is_empty() {
             self.clear()?;
         }
         Ok(active)
@@ -138,9 +207,12 @@ argv = ["sleep", "30"]
 
         let mut lock = LaunchTargetLock::acquire(temporary.path(), target).expect("second lock");
         assert!(lock.has_active_reservation().expect("active"));
-        child.kill().expect("kill");
+        assert_eq!(
+            lock.cancel_active_reservation().expect("cancel"),
+            Some(child.id())
+        );
         child.wait().expect("wait");
-        assert!(!lock.has_active_reservation().expect("stale"));
+        assert!(!lock.has_active_reservation().expect("cancelled"));
         std::env::remove_var("PORTBOARD_STATE_DIR");
     }
 }

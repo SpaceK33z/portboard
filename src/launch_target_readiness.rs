@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use url::Url;
 
 use crate::launch_target_config::LaunchTarget;
-use crate::launch_target_processes::find_launch_target_processes;
+use crate::launch_target_processes::{find_launch_target_processes, LaunchTargetProcess};
 use crate::runtime_metadata::{load_launch_target_runtime_metadata, RuntimeEndpoint};
 
 /// Waits for a target process and its primary HTTP endpoint to accept a request.
@@ -27,9 +27,12 @@ pub fn wait_for_launch_target_ready(
             if let Some(metadata) =
                 load_launch_target_runtime_metadata(worktree_root, target, &processes)?
             {
-                let Some(primary_endpoint) = metadata.primary_endpoint() else {
-                    return Ok(None);
-                };
+                let primary_endpoint = metadata.primary_endpoint().with_context(|| {
+                    format!(
+                        "Portboard launch target `{}` runtime metadata has no primary endpoint",
+                        target.id.as_str()
+                    )
+                })?;
                 if http_endpoint_is_ready(&primary_endpoint.url)? {
                     return Ok(Some(primary_endpoint.clone()));
                 }
@@ -38,6 +41,29 @@ pub fn wait_for_launch_target_ready(
         if Instant::now() >= deadline {
             bail!(
                 "Portboard launch target `{}` did not become ready within {} seconds",
+                target.id.as_str(),
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Waits until a target's final configured process signature becomes visible.
+pub fn wait_for_launch_target_process(
+    worktree_root: &Path,
+    target: &LaunchTarget,
+    timeout: Duration,
+) -> Result<Vec<LaunchTargetProcess>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let processes = find_launch_target_processes(worktree_root, target)?;
+        if !processes.is_empty() {
+            return Ok(processes);
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Portboard launch target `{}` process did not appear within {} seconds",
                 target.id.as_str(),
                 timeout.as_secs()
             );
@@ -77,10 +103,10 @@ fn http_endpoint_is_ready(endpoint_url: &str) -> Result<bool> {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
     };
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    )?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Ok(false);
+    }
     let mut status_line = String::new();
     if BufReader::new(stream).read_line(&mut status_line).is_err() {
         return Ok(false);
@@ -106,6 +132,48 @@ mod tests {
     use super::wait_for_launch_target_ready;
 
     #[test]
+    fn rejects_runtime_metadata_without_a_primary_endpoint() {
+        let worktree = tempfile::tempdir().expect("temporary worktree");
+        let marker = format!("portboard-no-primary-test-{}", std::process::id());
+        let mut child = Command::new("bash")
+            .args(["-c", &format!("exec -a {marker} sleep 30")])
+            .current_dir(worktree.path())
+            .spawn()
+            .expect("target process");
+        fs::write(
+            worktree.path().join("runtime.json"),
+            format!(
+                r#"{{"version":1,"targetId":"probe","pid":{},"startedAt":"2026-08-21T12:37:22.695Z","endpoints":[{{"id":"web","url":"http://127.0.0.1:1"}}]}}"#,
+                child.id()
+            ),
+        )
+        .expect("runtime metadata");
+        let config = parse_launch_target_config(&format!(
+            r#"
+version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["sleep", "30"]
+process_match = ["{marker}"]
+runtime_file = "runtime.json"
+"#
+        ))
+        .expect("manifest");
+
+        let error = wait_for_launch_target_ready(
+            worktree.path(),
+            &config.launch_targets[0],
+            Duration::from_secs(1),
+        )
+        .expect_err("primary endpoint is required");
+
+        child.kill().expect("stop target");
+        child.wait().expect("reap target");
+        assert!(error.to_string().contains("no primary endpoint"));
+    }
+
+    #[test]
     fn waits_for_the_primary_http_endpoint() {
         let worktree = tempfile::tempdir().expect("temporary worktree");
         let marker = format!("portboard-ready-test-{}", std::process::id());
@@ -118,8 +186,15 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("HTTP connection");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).expect("HTTP request");
+                request.extend_from_slice(&chunk[..read]);
+                if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .expect("HTTP response");

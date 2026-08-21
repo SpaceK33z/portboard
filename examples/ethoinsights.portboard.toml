@@ -5,3 +5,11 @@ id = "dev-full"
 label = "Full dev stack"
 argv = ["pnpm", "dev:full"]
 process_match = ["scripts/dev-full.mjs"]
+runtime_file = "logs/dev-instance.json"
+log_file = "logs/dev.log"
+
+[[launch_targets]]
+id = "test-watch"
+label = "Frontend test watcher"
+argv = ["bash", "scripts/dev-test-watch.sh"]
+process_match = ["node_modules/vitest/vitest.mjs", "--watch"]

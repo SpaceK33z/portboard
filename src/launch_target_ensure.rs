@@ -11,7 +11,9 @@ use crate::launch_target_lock::LaunchTargetLock;
 use crate::launch_target_processes::{
     find_launch_target_processes, process_has_portboard_target_identity, LaunchTargetProcess,
 };
-use crate::launch_target_readiness::wait_for_launch_target_ready;
+use crate::launch_target_readiness::{
+    wait_for_launch_target_process, wait_for_launch_target_ready,
+};
 use crate::manifest_approval::ensure_launch_target_approved;
 use crate::runtime_metadata::RuntimeEndpoint;
 
@@ -57,11 +59,10 @@ pub fn ensure_launch_target_in_herdr(
 
     if launch_lock.has_active_reservation()? {
         drop(launch_lock);
+        let processes =
+            wait_for_launch_target_process(worktree_root, target, DEFAULT_READINESS_TIMEOUT)?;
+        require_portboard_herdr_run(&workspace_id, target, &processes)?;
         let primary_endpoint = wait_if_requested(worktree_root, target, wait_until_ready)?;
-        if wait_until_ready {
-            let processes = find_launch_target_processes(worktree_root, target)?;
-            require_portboard_herdr_run(&workspace_id, target, &processes)?;
-        }
         return Ok(EnsureLaunchTargetResult {
             outcome: EnsureLaunchTargetOutcome::Starting,
             primary_endpoint,
@@ -69,8 +70,7 @@ pub fn ensure_launch_target_in_herdr(
     }
 
     ensure_launch_target_approved(worktree_root, config, target)?;
-    let launcher_pid =
-        launch_target_in_herdr(worktree_root, &workspace_id, target, false)?;
+    let launcher_pid = launch_target_in_herdr(worktree_root, &workspace_id, target, false)?;
     launch_lock.reserve_process(launcher_pid)?;
     drop(launch_lock);
     let primary_endpoint = wait_if_requested(worktree_root, target, wait_until_ready)?;
@@ -85,11 +85,14 @@ fn require_portboard_herdr_run(
     target: &LaunchTarget,
     processes: &[LaunchTargetProcess],
 ) -> Result<()> {
-    let has_portboard_identity = processes.iter().any(|process| {
-        process_has_portboard_target_identity(process, target.id.as_str())
-    });
-    let runs_in_herdr = launch_target_runs_in_herdr(workspace_id, processes)?;
-    if !has_portboard_identity || !runs_in_herdr {
+    let owned_processes = processes
+        .iter()
+        .filter(|process| process_has_portboard_target_identity(process, target.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let runs_in_herdr =
+        !owned_processes.is_empty() && launch_target_runs_in_herdr(workspace_id, &owned_processes)?;
+    if !runs_in_herdr {
         bail!(
             "Portboard launch target `{}` is running outside its Portboard-owned Herdr tab; stop it, then retry `portboard ensure {} --herdr --wait`",
             target.id.as_str(),

@@ -28,6 +28,8 @@ pub struct LaunchTarget {
     pub process_match: Vec<String>,
     #[serde(default)]
     pub runtime_file: Option<String>,
+    #[serde(default)]
+    pub log_file: Option<String>,
 }
 
 /// Parsed `portboard.toml` configuration for the current Git worktree.
@@ -102,18 +104,26 @@ fn validate_launch_target(target: &LaunchTarget) -> Result<()> {
     {
         bail!("Portboard launch target `{id}` has an empty process_match value");
     }
-    if let Some(runtime_file) = &target.runtime_file {
-        let path = Path::new(runtime_file);
-        if runtime_file.trim().is_empty()
-            || path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
-        {
-            bail!(
-                "Portboard launch target `{id}` runtime_file must be a relative path inside the worktree"
-            );
-        }
+    validate_worktree_relative_file(id, "runtime_file", target.runtime_file.as_deref())?;
+    validate_worktree_relative_file(id, "log_file", target.log_file.as_deref())?;
+    Ok(())
+}
+
+fn validate_worktree_relative_file(id: &str, field: &str, value: Option<&str>) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("Portboard launch target `{id}` {field} must be a relative path inside the worktree");
     }
     Ok(())
 }
@@ -134,6 +144,7 @@ label = "Full dev stack"
 argv = ["pnpm", "dev:full"]
 process_match = ["scripts/dev-full.mjs"]
 runtime_file = "logs/dev-instance.json"
+log_file = "logs/dev.log"
 "#,
         )
         .expect("valid manifest");
@@ -145,6 +156,10 @@ runtime_file = "logs/dev-instance.json"
         assert_eq!(
             config.launch_targets[0].runtime_file.as_deref(),
             Some("logs/dev-instance.json")
+        );
+        assert_eq!(
+            config.launch_targets[0].log_file.as_deref(),
+            Some("logs/dev.log")
         );
     }
 
@@ -168,6 +183,25 @@ process_match = ["\t"]
 "#,
         ] {
             parse_launch_target_config(manifest).expect_err("blank values must fail");
+        }
+    }
+
+    #[test]
+    fn rejects_files_outside_the_worktree() {
+        for field in ["runtime_file", "log_file"] {
+            let manifest = format!(
+                r#"
+version = 1
+[[launch_targets]]
+id = "dev"
+label = "Dev"
+argv = ["dev"]
+{field} = "../outside"
+"#
+            );
+            let error = parse_launch_target_config(&manifest)
+                .expect_err("worktree-relative file path must fail");
+            assert!(error.to_string().contains(field));
         }
     }
 

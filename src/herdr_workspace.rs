@@ -132,7 +132,7 @@ pub fn focus_launch_target_in_herdr(
     workspace_id: &str,
     processes: &[LaunchTargetProcess],
 ) -> Result<bool> {
-    let Some(tab_id) = find_launch_target_herdr_tab(workspace_id, processes)? else {
+    let Some(tab_id) = launch_target_herdr_tab_id(workspace_id, processes)? else {
         return Ok(false);
     };
     run_herdr_command(&["tab", "focus", &tab_id])?;
@@ -144,10 +144,11 @@ pub fn launch_target_runs_in_herdr(
     workspace_id: &str,
     processes: &[LaunchTargetProcess],
 ) -> Result<bool> {
-    Ok(find_launch_target_herdr_tab(workspace_id, processes)?.is_some())
+    Ok(launch_target_herdr_tab_id(workspace_id, processes)?.is_some())
 }
 
-fn find_launch_target_herdr_tab(
+/// Returns the Herdr tab containing one of the matching target processes.
+pub fn launch_target_herdr_tab_id(
     workspace_id: &str,
     processes: &[LaunchTargetProcess],
 ) -> Result<Option<String>> {
@@ -173,6 +174,16 @@ fn find_launch_target_herdr_tab(
         return Ok(Some(pane.tab_id));
     }
     Ok(None)
+}
+
+/// Closes a Herdr tab after its Portboard-owned target has stopped.
+pub fn close_launch_target_herdr_tab(tab_id: &str) -> Result<()> {
+    run_herdr_command(&["tab", "close", tab_id])
+}
+
+/// Focuses an explicit Herdr tab by identifier.
+pub fn focus_herdr_tab(tab_id: &str) -> Result<()> {
+    run_herdr_command(&["tab", "focus", tab_id])
 }
 
 fn run_herdr_json<T: DeserializeOwned>(arguments: &[&str]) -> Result<T> {
