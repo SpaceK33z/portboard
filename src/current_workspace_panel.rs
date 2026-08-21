@@ -4,44 +4,55 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
+use crate::browser_url::{browser_url, open_browser_url, osc8_hyperlink, UrlOpenOutcome};
 use crate::current_workspace_status::{
     inspect_worktree_launch_targets, CurrentLaunchTargetStatus, LaunchTargetRuntimeState,
 };
+use crate::herdr_workspace::current_herdr_workspace_id;
 use crate::launch_target_config::load_worktree_launch_targets;
 use crate::launch_target_open::open_or_start_launch_target;
-use crate::launch_target_stop::stop_launch_target;
+use crate::launch_target_stop::{stop_launch_target, stop_launch_target_and_close_herdr_tab};
+use crate::worktree_processes::inspect_worktree_processes;
 
-const PANEL_FOOTER: &str = "\x1b[2menter\x1b[0m open/start · \x1b[2mctrl-s\x1b[0m stop · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mesc\x1b[0m close";
+const PANEL_FOOTER: &str = "\x1b[2menter\x1b[0m open/start · \x1b[2mctrl-o\x1b[0m url · \x1b[2mctrl-s\x1b[0m stop · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mesc\x1b[0m close";
 const INFORMATION_FOOTER: &str = "\x1b[2mesc\x1b[0m close";
+const URL_FOOTER: &str = "ctrl-click the URL to open it · esc back";
 
 /// Opens the current worktree launch targets in a transient fzf panel.
 pub fn open_current_workspace_panel(worktree_root: &Path) -> Result<()> {
     if !worktree_root.join("portboard.toml").is_file() {
+        let process_summary = inspect_worktree_processes(worktree_root, &[])
+            .map(|entries| format!("{} processes running", entries.len()))
+            .unwrap_or_else(|_| "process scan failed".to_string());
         return open_information_panel(&format!(
-            "No portboard.toml in {:?} · add one to configure launch targets",
+            "No portboard.toml in {:?} · {process_summary} · add a manifest to manage them as launch targets",
             worktree_root
         ));
     }
 
     loop {
         let config = load_worktree_launch_targets(worktree_root)?;
-        let statuses = inspect_worktree_launch_targets(worktree_root, &config)?;
+        let inspection = inspect_worktree_launch_targets(worktree_root, &config)?;
+        let statuses = &inspection.statuses;
         if statuses.is_empty() {
             bail!("Portboard manifest has no launch targets");
         }
 
-        let rows = panel_rows(&statuses);
+        let rows = panel_rows(statuses);
         let target_width = column_width("TARGET", rows.iter().map(|row| row.target.as_str()));
         let status_width = column_width("STATUS", rows.iter().map(|row| row.status));
         let endpoints_width =
             column_width("ENDPOINTS", rows.iter().map(|row| row.endpoints.as_str()));
-        let header = format!(
+        let mut header = format!(
             "{}  {}  {}  {}",
             pad_column("TARGET", target_width),
             pad_column("STATUS", status_width),
             pad_column("ENDPOINTS", endpoints_width),
             "PIDS"
         );
+        for finding in &inspection.findings {
+            header.push_str(&format!("\nwarning: {finding}"));
+        }
 
         let mut fzf = Command::new("fzf");
         fzf.args([
@@ -53,7 +64,7 @@ pub fn open_current_workspace_panel(worktree_root: &Path) -> Result<()> {
             "--border=rounded",
             "--ansi",
             "--prompt=portboard ❯ ",
-            "--expect=enter,ctrl-s,ctrl-r",
+            "--expect=enter,ctrl-s,ctrl-r,ctrl-o",
             "--header",
             &header,
             "--footer",
@@ -110,6 +121,24 @@ pub fn open_current_workspace_panel(worktree_root: &Path) -> Result<()> {
             .filter(|value| !value.is_empty())
             .context("Portboard panel selection did not contain a launch target id")?;
 
+        if key == "ctrl-o" {
+            let status = statuses
+                .iter()
+                .find(|status| status.id.as_str() == target_id)
+                .context("Portboard panel selected an unknown launch target")?;
+            match browser_url(status) {
+                Some(url) => {
+                    let outcome = open_browser_url(&url);
+                    show_endpoint_url_panel(&status.label, &url, outcome)?;
+                }
+                None => open_information_panel(&format!(
+                    "{} has no discovered endpoint to open",
+                    status.label
+                ))?,
+            }
+            continue;
+        }
+
         if key == "ctrl-s" {
             let refreshed_config = load_worktree_launch_targets(worktree_root)?;
             if refreshed_config != config {
@@ -120,7 +149,13 @@ pub fn open_current_workspace_panel(worktree_root: &Path) -> Result<()> {
                 .iter()
                 .find(|target| target.id.as_str() == target_id)
                 .context("Portboard panel selected an unknown launch target")?;
-            match stop_launch_target(worktree_root, target) {
+            let stop_result = match current_herdr_workspace_id() {
+                Some(workspace_id) => {
+                    stop_launch_target_and_close_herdr_tab(worktree_root, target, &workspace_id)
+                }
+                None => stop_launch_target(worktree_root, target),
+            };
+            match stop_result {
                 Ok(_) => continue,
                 Err(error) => {
                     eprintln!("{error:#}");
@@ -151,6 +186,14 @@ fn panel_rows(statuses: &[CurrentLaunchTargetStatus]) -> Vec<PanelRow> {
         .map(|target| {
             let (status, pids) = match &target.state {
                 LaunchTargetRuntimeState::Stopped => ("stopped", "—".to_string()),
+                LaunchTargetRuntimeState::Running { processes } if target.duplicate => (
+                    "duplicate!",
+                    processes
+                        .iter()
+                        .map(|process| process.pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
                 LaunchTargetRuntimeState::Running { processes } => (
                     "running",
                     processes
@@ -160,7 +203,14 @@ fn panel_rows(statuses: &[CurrentLaunchTargetStatus]) -> Vec<PanelRow> {
                         .join(", "),
                 ),
             };
-            let endpoints = if target.endpoints.is_empty() {
+            let endpoints = if !target.named_endpoints.is_empty() {
+                target
+                    .named_endpoints
+                    .iter()
+                    .map(|endpoint| format!("{} {}", endpoint.id, endpoint.url))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if target.endpoints.is_empty() {
                 "—".to_string()
             } else {
                 target
@@ -210,6 +260,45 @@ fn truncate_column(value: &str, width: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+/// Shows one launch target URL as a clickable link, then returns to the panel.
+fn show_endpoint_url_panel(label: &str, url: &str, outcome: UrlOpenOutcome) -> Result<()> {
+    // No --ansi here: fzf would strip the OSC 8 hyperlink escape sequence, and
+    // Herdr needs it (or the visible URL) intact for ctrl-click opening.
+    let mut fzf = Command::new("fzf")
+        .args([
+            "--disabled",
+            "--no-sort",
+            "--reverse",
+            "--info=inline",
+            "--border=rounded",
+            "--prompt=portboard ❯ ",
+            "--footer",
+            URL_FOOTER,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .context("Portboard panel could not start fzf")?;
+    {
+        let input = fzf
+            .stdin
+            .as_mut()
+            .context("Portboard panel could not open fzf input")?;
+        match outcome {
+            UrlOpenOutcome::OpenedLocally => writeln!(input, "{label} opened in your browser")?,
+            UrlOpenOutcome::OfferedLink => writeln!(input, "{label}")?,
+        }
+        writeln!(input, "{}", osc8_hyperlink(url))?;
+    }
+    let status = fzf
+        .wait()
+        .context("Portboard panel could not wait for fzf")?;
+    if status.success() || matches!(status.code(), Some(1 | 130)) {
+        return Ok(());
+    }
+    bail!("Portboard panel fzf exited with {status}")
 }
 
 fn open_information_panel(message: &str) -> Result<()> {

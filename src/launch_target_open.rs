@@ -22,6 +22,21 @@ pub fn open_or_start_launch_target(
     let processes = find_launch_target_processes(worktree_root, target)?;
     if !processes.is_empty() {
         launch_lock.clear()?;
+        if processes.len() > 1 {
+            println!(
+                "{} has {} duplicate instances running; refusing to focus or start another",
+                target.label,
+                processes.len()
+            );
+            for process in &processes {
+                println!(
+                    "  pid {}: {}",
+                    process.pid,
+                    serde_json::to_string(&process.argv)?
+                );
+            }
+            return Ok(());
+        }
         let focused_in_herdr = match current_herdr_workspace_id() {
             Some(workspace_id) => focus_launch_target_in_herdr(&workspace_id, &processes)?,
             None => false,

@@ -1,9 +1,11 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -181,7 +183,35 @@ fn record_approval_at(
 }
 
 fn worktree_identity(worktree_root: &Path) -> Vec<u8> {
-    worktree_root.as_os_str().as_bytes().to_vec()
+    repository_identity(worktree_root)
+        .unwrap_or_else(|| worktree_root.as_os_str().as_bytes().to_vec())
+}
+
+fn repository_identity(worktree_root: &Path) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .current_dir(worktree_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut common_directory = output.stdout;
+    if common_directory.last() == Some(&b'\n') {
+        common_directory.pop();
+    }
+    if common_directory.last() == Some(&b'\r') {
+        common_directory.pop();
+    }
+    let path = PathBuf::from(OsString::from_vec(common_directory));
+    let canonical = path.canonicalize().ok()?;
+    Some(canonical.as_os_str().as_bytes().to_vec())
 }
 
 fn lock_store(store_path: &Path) -> Result<File> {
@@ -264,6 +294,9 @@ fn write_store(path: &Path, store: &ApprovalStore) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
     use super::{is_approved_at, record_approval_at};
 
     #[test]
@@ -279,6 +312,55 @@ mod tests {
         assert!(
             !is_approved_at(&store, &worktree, "version = 1", "worker").expect("different target")
         );
+    }
+
+    #[test]
+    fn approval_applies_to_identical_manifest_in_linked_worktrees() {
+        let temporary = tempfile::tempdir().expect("temporary state");
+        let store = temporary.path().join("approvals.json");
+        let repository = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        fs::create_dir(&repository).expect("repository directory");
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repository)
+            .status()
+            .expect("git init")
+            .success());
+        fs::write(repository.join("tracked"), "tracked").expect("tracked file");
+        assert!(Command::new("git")
+            .args(["add", "tracked"])
+            .current_dir(&repository)
+            .status()
+            .expect("git add")
+            .success());
+        assert!(Command::new("git")
+            .args([
+                "-c",
+                "user.name=Portboard Test",
+                "-c",
+                "user.email=portboard@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repository)
+            .status()
+            .expect("git commit")
+            .success());
+        assert!(Command::new("git")
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&linked)
+            .current_dir(&repository)
+            .status()
+            .expect("git worktree add")
+            .success());
+
+        record_approval_at(&store, &repository, "version = 1", "web").expect("primary approval");
+
+        assert!(is_approved_at(&store, &linked, "version = 1", "web")
+            .expect("linked worktree approval"));
     }
 
     #[test]

@@ -52,12 +52,20 @@ pub fn load_launch_target_runtime_metadata(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("Portboard runtime metadata could not read {}", path.display())
+                format!(
+                    "Portboard runtime metadata could not read {}",
+                    path.display()
+                )
             });
         }
     };
-    let metadata: LaunchTargetRuntimeMetadata = serde_json::from_str(&contents)
-        .with_context(|| format!("Portboard runtime metadata is invalid at {}", path.display()))?;
+    let metadata: LaunchTargetRuntimeMetadata =
+        serde_json::from_str(&contents).with_context(|| {
+            format!(
+                "Portboard runtime metadata is invalid at {}",
+                path.display()
+            )
+        })?;
     validate_runtime_metadata(target, &metadata, &path)?;
     if !processes.iter().any(|process| process.pid == metadata.pid) {
         return Ok(None);

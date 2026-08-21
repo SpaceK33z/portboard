@@ -1,5 +1,6 @@
 //! Current-workspace launch target discovery and execution.
 
+pub mod browser_url;
 pub mod current_workspace_panel;
 pub mod current_workspace_status;
 pub mod current_worktree;
@@ -17,3 +18,4 @@ pub mod portboard_cli;
 pub mod process_endpoints;
 pub mod runtime_metadata;
 pub mod state_paths;
+pub mod worktree_processes;

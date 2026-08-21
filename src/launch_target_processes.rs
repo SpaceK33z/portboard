@@ -13,22 +13,47 @@ pub struct LaunchTargetProcess {
     pub argv: Vec<String>,
 }
 
+/// Live operating-system process whose cwd is inside one worktree.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorktreeProcess {
+    pub pid: u32,
+    pub argv: Vec<String>,
+}
+
 /// Finds live Linux processes whose cwd and argv match a worktree launch target.
 pub fn find_launch_target_processes(
     worktree_root: &Path,
     target: &LaunchTarget,
 ) -> Result<Vec<LaunchTargetProcess>> {
+    let process_match = if target.process_match.is_empty() {
+        &target.argv
+    } else {
+        &target.process_match
+    };
+    let mut matches = Vec::new();
+    for process in find_worktree_processes(worktree_root)? {
+        let searchable_command = process.argv.join(" ");
+        if process_match
+            .iter()
+            .all(|expected| searchable_command.contains(expected))
+        {
+            matches.push(LaunchTargetProcess {
+                pid: process.pid,
+                argv: process.argv,
+            });
+        }
+    }
+    Ok(matches)
+}
+
+/// Scans `/proc` for every live process whose cwd is inside the canonical worktree.
+pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProcess>> {
     let canonical_root = worktree_root.canonicalize().with_context(|| {
         format!(
             "Portboard process scan could not resolve worktree {}",
             worktree_root.display()
         )
     })?;
-    let process_match = if target.process_match.is_empty() {
-        &target.argv
-    } else {
-        &target.process_match
-    };
     let mut matches = Vec::new();
 
     for entry in fs::read_dir("/proc").context("Portboard process scan could not read /proc")? {
@@ -67,14 +92,12 @@ pub fn find_launch_target_processes(
         if argv.is_empty() {
             continue;
         }
-        let searchable_command = argv.join(" ");
-        if process_match
-            .iter()
-            .all(|expected| searchable_command.contains(expected))
-            && read_process_start_time(&process_path) == Some(start_time)
-        {
-            matches.push(LaunchTargetProcess { pid, argv });
+        // Re-reading the start time prevents a PID reused between the two
+        // reads from being reported as a live run.
+        if read_process_start_time(&process_path) != Some(start_time) {
+            continue;
         }
+        matches.push(WorktreeProcess { pid, argv });
     }
 
     matches.sort_by_key(|process| process.pid);
@@ -173,8 +196,6 @@ process_match = ["{marker}"]
         let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
             .expect("process scan");
 
-        child.kill().expect("stop test process");
-        child.wait().expect("reap test process");
         let process = processes
             .iter()
             .find(|process| process.pid == child.id())
@@ -183,5 +204,7 @@ process_match = ["{marker}"]
             process,
             "test-server"
         ));
+        child.kill().expect("stop test process");
+        child.wait().expect("reap test process");
     }
 }
