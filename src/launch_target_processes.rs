@@ -32,11 +32,12 @@ pub fn find_launch_target_processes(
     };
     let mut matches = Vec::new();
     for process in find_worktree_processes(worktree_root)? {
-        let searchable_command = process.argv.join(" ");
-        if process_match
-            .iter()
-            .all(|expected| searchable_command.contains(expected))
-        {
+        if process_match.iter().all(|expected| {
+            process
+                .argv
+                .iter()
+                .any(|argument| process_argument_matches(argument, expected))
+        }) {
             matches.push(LaunchTargetProcess {
                 pid: process.pid,
                 argv: process.argv,
@@ -118,6 +119,10 @@ pub fn process_has_portboard_target_identity(
         .any(|entry| entry == expected.as_bytes())
 }
 
+fn process_argument_matches(argument: &str, expected: &str) -> bool {
+    argument == expected || Path::new(argument).ends_with(Path::new(expected))
+}
+
 fn read_process_start_time(process_path: &Path) -> Option<u64> {
     let stat = fs::read_to_string(process_path.join("stat")).ok()?;
     // The comm field is parenthesized and may itself contain spaces or `)`.
@@ -166,6 +171,40 @@ process_match = ["{executable_name}"]
         assert!(!processes
             .iter()
             .any(|process| process.pid == std::process::id()));
+    }
+
+    #[test]
+    fn does_not_match_a_shell_command_that_only_mentions_the_signature() {
+        let temporary = tempfile::tempdir().expect("temporary worktree");
+        let marker = format!("portboard-mentioned-signature-{}", std::process::id());
+        let config = parse_launch_target_config(&format!(
+            r#"
+version = 1
+[[launch_targets]]
+id = "test-server"
+label = "Test server"
+argv = ["sleep", "30"]
+process_match = ["{marker}"]
+"#
+        ))
+        .expect("launch target config");
+        let mut child = Command::new("bash")
+            .args([
+                "-c",
+                &format!("while true; do sleep 1; done # mentions {marker}"),
+            ])
+            .current_dir(temporary.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("shell process");
+
+        let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
+            .expect("process scan");
+
+        child.kill().expect("stop shell process");
+        child.wait().expect("reap shell process");
+        assert!(!processes.iter().any(|process| process.pid == child.id()));
     }
 
     #[test]
