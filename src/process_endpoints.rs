@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
@@ -19,41 +20,75 @@ pub struct ProcessEndpoint {
 /// Discovers Linux TCP listeners owned by matching processes and their child
 /// process trees.
 pub fn find_process_endpoints(processes: &[LaunchTargetProcess]) -> Result<Vec<ProcessEndpoint>> {
+    let mut endpoints = find_process_endpoints_by_process(processes)?
+        .into_values()
+        .flatten()
+        .collect::<Vec<_>>();
+    endpoints.sort();
+    endpoints.dedup();
+    Ok(endpoints)
+}
+
+/// Discovers Linux TCP listeners and attributes every endpoint to the root
+/// process whose tree (the process itself or one of its descendants) owns the
+/// socket. Roots with no listeners are absent from the result.
+pub fn find_process_endpoints_by_process(
+    processes: &[LaunchTargetProcess],
+) -> Result<HashMap<u32, Vec<ProcessEndpoint>>> {
+    let mut grouped: HashMap<u32, Vec<ProcessEndpoint>> = HashMap::new();
     if processes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(grouped);
     }
     let roots = processes
         .iter()
         .map(|process| process.pid)
         .collect::<HashSet<_>>();
     let parents = read_process_parents()?;
-    let owners = parents
-        .keys()
-        .copied()
-        .filter(|pid| descends_from_any(*pid, &roots, &parents))
-        .chain(roots.iter().copied())
-        .collect::<HashSet<_>>();
-    let socket_inodes = owners
-        .iter()
-        .flat_map(|pid| process_socket_inodes(*pid))
-        .collect::<HashSet<_>>();
-
-    let mut endpoints = Vec::new();
+    // Map every owned socket inode to the root process whose tree holds it so
+    // one pass over the kernel TCP tables can attribute each listener.
+    let mut socket_owners: HashMap<u64, u32> = HashMap::new();
+    for pid in parents.keys().copied().chain(roots.iter().copied()) {
+        let Some(root) = owning_root(pid, &roots, &parents) else {
+            continue;
+        };
+        for inode in process_socket_inodes(pid) {
+            socket_owners.insert(inode, root);
+        }
+    }
     read_tcp_endpoints(
         Path::new("/proc/net/tcp"),
         false,
-        &socket_inodes,
-        &mut endpoints,
+        &socket_owners,
+        &mut grouped,
     )?;
     read_tcp_endpoints(
         Path::new("/proc/net/tcp6"),
         true,
-        &socket_inodes,
-        &mut endpoints,
+        &socket_owners,
+        &mut grouped,
     )?;
-    endpoints.sort();
-    endpoints.dedup();
-    Ok(endpoints)
+    for endpoints in grouped.values_mut() {
+        endpoints.sort();
+        endpoints.dedup();
+    }
+    Ok(grouped)
+}
+
+/// Walks the parent chain from `pid` and returns the root process whose tree
+/// contains it, or `None` when the chain leaves every root.
+fn owning_root(pid: u32, roots: &HashSet<u32>, parents: &HashMap<u32, u32>) -> Option<u32> {
+    let mut current = pid;
+    for _ in 0..128 {
+        if roots.contains(&current) {
+            return Some(current);
+        }
+        let parent = parents.get(&current).copied()?;
+        if parent <= 1 || parent == current {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 fn read_process_parents() -> Result<HashMap<u32, u32>> {
@@ -80,23 +115,6 @@ fn read_process_parents() -> Result<HashMap<u32, u32>> {
     Ok(parents)
 }
 
-fn descends_from_any(pid: u32, roots: &HashSet<u32>, parents: &HashMap<u32, u32>) -> bool {
-    let mut current = pid;
-    for _ in 0..128 {
-        if roots.contains(&current) {
-            return true;
-        }
-        let Some(parent) = parents.get(&current).copied() else {
-            return false;
-        };
-        if parent <= 1 || parent == current {
-            return roots.contains(&parent);
-        }
-        current = parent;
-    }
-    false
-}
-
 fn process_socket_inodes(pid: u32) -> Vec<u64> {
     let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return Vec::new();
@@ -117,8 +135,8 @@ fn process_socket_inodes(pid: u32) -> Vec<u64> {
 fn read_tcp_endpoints(
     path: &Path,
     ipv6: bool,
-    owned_inodes: &HashSet<u64>,
-    output: &mut Vec<ProcessEndpoint>,
+    socket_owners: &HashMap<u64, u32>,
+    output: &mut HashMap<u32, Vec<ProcessEndpoint>>,
 ) -> Result<()> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
@@ -134,16 +152,16 @@ fn read_tcp_endpoints(
         if fields.len() < 10 || fields[3] != "0A" {
             continue;
         }
-        let Ok(inode) = fields[9].parse::<u64>() else {
+        let Some(inode) = fields[9].parse::<u64>().ok() else {
             continue;
         };
-        if !owned_inodes.contains(&inode) {
+        let Some(&root) = socket_owners.get(&inode) else {
             continue;
-        }
+        };
         let Some((address, port)) = parse_local_address(fields[1], ipv6) else {
             continue;
         };
-        output.push(ProcessEndpoint {
+        output.entry(root).or_default().push(ProcessEndpoint {
             protocol: "tcp",
             address,
             port,
@@ -177,7 +195,7 @@ mod tests {
 
     use crate::launch_target_processes::LaunchTargetProcess;
 
-    use super::{find_process_endpoints, parse_local_address};
+    use super::{find_process_endpoints, find_process_endpoints_by_process, parse_local_address};
 
     #[test]
     fn parses_proc_tcp_addresses() {
@@ -203,6 +221,25 @@ mod tests {
         let endpoints = find_process_endpoints(&processes).expect("endpoint scan");
 
         assert!(endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "127.0.0.1" && endpoint.port == port));
+    }
+
+    #[test]
+    fn attributes_listeners_to_their_owning_root() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let processes = vec![LaunchTargetProcess {
+            pid: std::process::id(),
+            argv: Vec::new(),
+        }];
+
+        let grouped = find_process_endpoints_by_process(&processes).expect("grouped endpoints");
+
+        let owned = grouped
+            .get(&std::process::id())
+            .expect("owning root present");
+        assert!(owned
             .iter()
             .any(|endpoint| endpoint.address == "127.0.0.1" && endpoint.port == port));
     }

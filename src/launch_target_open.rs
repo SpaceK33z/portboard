@@ -9,7 +9,6 @@ use crate::herdr_workspace::{
 use crate::launch_target_config::{LaunchTarget, PortboardConfig};
 use crate::launch_target_lock::LaunchTargetLock;
 use crate::launch_target_processes::find_launch_target_processes;
-use crate::manifest_approval::ensure_launch_target_approved;
 
 /// Opens an existing launch target run or starts it in the best available run host.
 pub fn open_or_start_launch_target(
@@ -64,8 +63,6 @@ pub fn open_or_start_launch_target(
         println!("{} is starting", target.label);
         return Ok(());
     }
-
-    ensure_launch_target_approved(worktree_root, config, target)?;
 
     if let Some(workspace_id) = current_herdr_workspace_id() {
         let pid = launch_target_in_herdr(worktree_root, &workspace_id, target, true)?;

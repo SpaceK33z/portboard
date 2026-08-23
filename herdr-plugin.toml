@@ -14,6 +14,18 @@ title = "Portboard: current workspace"
 contexts = ["workspace"]
 command = ["./target/release/portboard", "plugin-open"]
 
+[[actions]]
+id = "open-url"
+title = "Portboard: open clicked URL"
+contexts = ["workspace"]
+command = ["./target/release/portboard", "open-url"]
+
+[[link_handlers]]
+id = "localhost"
+title = "Open localhost URL with Portboard"
+pattern = "^https?://(localhost|127\\.0\\.0\\.1|\\[::1\\])(:[0-9]+)?([/?#].*)?$"
+action = "open-url"
+
 [[panes]]
 id = "current"
 title = "Portboard"

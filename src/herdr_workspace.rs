@@ -95,7 +95,9 @@ pub fn launch_target_in_herdr(
         let _ = run_herdr_command(&["tab", "close", &tab_id]);
         return Err(error).context("Portboard Herdr launch could not start the target command");
     }
-    let Some(launcher_pid) = foreground_process_pid(&pane_id, Duration::from_millis(500)) else {
+    // Manifests may run preparation hooks (dependency installs, reapers)
+    // before the target command itself appears, so allow a generous window.
+    let Some(launcher_pid) = foreground_process_pid(&pane_id, Duration::from_secs(10)) else {
         let _ = run_herdr_command(&["tab", "close", &tab_id]);
         bail!(
             "Portboard Herdr launch could not identify the target process; the new tab was closed"
@@ -107,6 +109,11 @@ pub fn launch_target_in_herdr(
     Ok(launcher_pid)
 }
 
+/// Resolves the pid of the command started via `herdr pane run`. Right after
+/// the run request the pane's foreground process is still its interactive
+/// shell; reserving that shell would pin the launch reservation to a process
+/// that outlives the target, so shell pids are skipped until the real command
+/// appears (or the timeout expires).
 fn foreground_process_pid(pane_id: &str, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -116,7 +123,14 @@ fn foreground_process_pid(pane_id: &str, timeout: Duration) -> Option<u32> {
             "--pane",
             pane_id,
         ]) {
-            if let Some(process) = response.result.process_info.foreground_processes.first() {
+            let shell_pid = response.result.process_info.shell_pid;
+            if let Some(process) = response
+                .result
+                .process_info
+                .foreground_processes
+                .iter()
+                .find(|process| process.pid != shell_pid)
+            {
                 return Some(process.pid);
             }
         }

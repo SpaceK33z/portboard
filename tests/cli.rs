@@ -50,117 +50,6 @@ fn portboard(repository: &tempfile::TempDir, state: &tempfile::TempDir) -> Comma
 }
 
 #[test]
-fn refuses_an_unapproved_noninteractive_command() {
-    let repository = initialize_repository(
-        r#"
-version = 1
-[[launch_targets]]
-id = "probe"
-label = "Probe"
-argv = ["sh", "-c", "printf executed > marker"]
-process_match = ["portboard-never-running-approval-test"]
-"#,
-    );
-    let state = tempfile::tempdir().expect("temporary state");
-
-    let output = portboard(&repository, &state)
-        .output()
-        .expect("portboard open");
-
-    assert!(!output.status.success());
-    assert!(!repository.path().join("marker").exists());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(stderr.contains("requires approval"));
-    assert!(stderr.contains(repository.path().to_str().expect("repository path")));
-    assert!(stderr.contains(r#"["sh","-c","printf executed > marker"]"#));
-
-    let almost_approved = portboard(&repository, &state)
-        .env("PORTBOARD_APPROVE", "true")
-        .output()
-        .expect("strict noninteractive approval");
-    assert!(!almost_approved.status.success());
-    assert!(!repository.path().join("marker").exists());
-}
-
-#[test]
-fn approve_records_trust_without_starting_the_target() {
-    let repository = initialize_repository(
-        r#"
-version = 1
-[[launch_targets]]
-id = "probe"
-label = "Probe"
-argv = ["sh", "-c", "printf executed > marker"]
-process_match = ["portboard-never-running-approve-command-test"]
-"#,
-    );
-    let state = tempfile::tempdir().expect("temporary state");
-
-    let approved = Command::new(env!("CARGO_BIN_EXE_portboard"))
-        .args(["approve", "probe", "--cwd"])
-        .arg(repository.path())
-        .env("PORTBOARD_STATE_DIR", state.path())
-        .env("PORTBOARD_APPROVE", "1")
-        .output()
-        .expect("Portboard approve");
-
-    assert!(approved.status.success());
-    assert!(!repository.path().join("marker").exists());
-    let started = portboard(&repository, &state)
-        .status()
-        .expect("approved start");
-    assert!(started.success());
-    assert!(repository.path().join("marker").exists());
-}
-
-#[test]
-fn explicit_approval_is_persisted_and_manifest_changes_revoke_it() {
-    let repository = initialize_repository(
-        r#"
-version = 1
-[[launch_targets]]
-id = "probe"
-label = "Probe"
-argv = ["sh", "-c", "printf first >> marker"]
-process_match = ["portboard-never-running-persist-test"]
-"#,
-    );
-    let state = tempfile::tempdir().expect("temporary state");
-
-    let first = portboard(&repository, &state)
-        .env("PORTBOARD_APPROVE", "1")
-        .status()
-        .expect("approved open");
-    assert!(first.success());
-    let second = portboard(&repository, &state)
-        .status()
-        .expect("persisted approval open");
-    assert!(second.success());
-    assert_eq!(
-        fs::read_to_string(repository.path().join("marker")).expect("marker"),
-        "firstfirst"
-    );
-
-    fs::write(
-        repository.path().join("portboard.toml"),
-        r#"
-version = 1
-[[launch_targets]]
-id = "probe"
-label = "Probe"
-argv = ["sh", "-c", "printf changed >> changed-marker"]
-process_match = ["portboard-never-running-persist-test"]
-"#,
-    )
-    .expect("changed manifest");
-    let changed = portboard(&repository, &state)
-        .output()
-        .expect("changed open");
-    assert!(!changed.status.success());
-    assert!(!repository.path().join("changed-marker").exists());
-}
-
-#[test]
 fn ensure_with_required_herdr_refuses_to_start_without_a_workspace() {
     let repository = initialize_repository(
         r#"
@@ -178,7 +67,6 @@ process_match = ["portboard-never-running-required-herdr-test"]
         .args(["ensure", "probe", "--herdr", "--cwd"])
         .arg(repository.path())
         .env("PORTBOARD_STATE_DIR", state.path())
-        .env("PORTBOARD_APPROVE", "1")
         .env_remove("HERDR_WORKSPACE_ID")
         .env_remove("PORTBOARD_WORKSPACE_ID")
         .stdin(Stdio::null())
@@ -454,15 +342,7 @@ process_match = ["{marker}"]
     .expect("launcher script");
     let state = tempfile::tempdir().expect("temporary state");
 
-    // Establish approval, then clear the probe run's output before exercising
-    // two genuinely concurrent open calls.
-    let approved = portboard(&repository, &state)
-        .env("PORTBOARD_APPROVE", "1")
-        .status()
-        .expect("approval run");
-    assert!(approved.success());
-    fs::remove_file(repository.path().join("starts")).expect("clear starts");
-
+    // Two genuinely concurrent open calls must only start the target once.
     let mut first = portboard(&repository, &state)
         .stdout(Stdio::null())
         .stderr(Stdio::null())

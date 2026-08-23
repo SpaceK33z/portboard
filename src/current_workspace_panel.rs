@@ -1,256 +1,934 @@
-use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
+//! The current-workspace Portboard terminal panel.
+//!
+//! The panel is a ratatui TUI shown in a Herdr popup pane (or any terminal via
+//! `portboard panel`). A target list on the left drives a detail pane on the
+//! right that lists every endpoint as its own untruncated, clickable/copyable
+//! row, which is more room than the previous fzf picker could offer for URLs
+//! and future rich interactions.
+//!
+//! Keys:
+//!   enter            open or start the selected target / open the selected port
+//!   o                open the selected endpoint / primary URL in a browser
+//!   y                copy the endpoint / primary URL to the clipboard (OSC 52)
+//!   s                stop the selected target
+//!   r                refresh the inspection now (also polls every 2s)
+//!   tab / ← / →      cycle focus between targets, ports, and endpoints
+//!   ↑↓ / jk          move the cursor in the focused list
+//!
+//! The focused pane is always drawn with a bright cyan border and title while
+//! the other panes are dimmed, and its selected row is reversed; unfocused
+//! panes keep their cursor visible but subdued.
+//!   mouse            click a row to select it; click an endpoint or port to open it
+//!   q / esc          close the panel (esc first steps focus back)
 
-use anyhow::{bail, Context, Result};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crate::browser_url::{browser_url, open_browser_url, osc8_hyperlink, UrlOpenOutcome};
+use anyhow::{Context, Result};
+
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
+
+use crate::browser_url::{browser_url, copy_url_to_clipboard, open_browser_url, UrlOpenOutcome};
 use crate::current_workspace_status::{
     inspect_worktree_launch_targets, CurrentLaunchTargetStatus, LaunchTargetRuntimeState,
+    WorktreeLaunchTargetInspection,
 };
 use crate::herdr_workspace::current_herdr_workspace_id;
 use crate::launch_target_config::load_worktree_launch_targets;
 use crate::launch_target_open::open_or_start_launch_target;
 use crate::launch_target_stop::{stop_launch_target, stop_launch_target_and_close_herdr_tab};
-use crate::worktree_processes::inspect_worktree_processes;
+use crate::worktree_processes::{inspect_worktree_processes, WorktreeProcessInventoryEntry};
 
-const PANEL_FOOTER: &str = "\x1b[2menter\x1b[0m open/start · \x1b[2mctrl-o\x1b[0m url · \x1b[2mctrl-s\x1b[0m stop · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mesc\x1b[0m close";
-const INFORMATION_FOOTER: &str = "\x1b[2mesc\x1b[0m close";
-const URL_FOOTER: &str = "ctrl-click the URL to open it · esc back";
+/// How often the panel re-inspects targets so running/stopped status stays live.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const KEY_HINTS: &str =
+    "enter open · o open url · y copy · s stop · r refresh · tab lists · q/esc close";
 
-/// Opens the current worktree launch targets in a transient fzf panel.
+/// Opens the current worktree launch targets in a terminal panel.
 pub fn open_current_workspace_panel(worktree_root: &Path) -> Result<()> {
-    if !worktree_root.join("portboard.toml").is_file() {
-        let process_summary = inspect_worktree_processes(worktree_root, &[])
-            .map(|entries| format!("{} processes running", entries.len()))
-            .unwrap_or_else(|_| "process scan failed".to_string());
-        return open_information_panel(&format!(
-            "No portboard.toml in {:?} · {process_summary} · add a manifest to manage them as launch targets",
-            worktree_root
-        ));
-    }
+    let mut app = PanelApp::new(worktree_root)?;
+    app.refresh();
 
-    loop {
-        let config = load_worktree_launch_targets(worktree_root)?;
-        let inspection = inspect_worktree_launch_targets(worktree_root, &config)?;
-        let statuses = &inspection.statuses;
-        if statuses.is_empty() {
-            bail!("Portboard manifest has no launch targets");
-        }
+    enable_raw_mode().context("Portboard panel could not enable raw mode")?;
+    let _raw_guard = RawModeGuard;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("Portboard panel could not enter the alternate screen")?;
 
-        let rows = panel_rows(statuses);
-        let target_width = column_width("TARGET", rows.iter().map(|row| row.target.as_str()));
-        let status_width = column_width("STATUS", rows.iter().map(|row| row.status));
-        let endpoints_width =
-            column_width("ENDPOINTS", rows.iter().map(|row| row.endpoints.as_str()));
-        let mut header = format!(
-            "{}  {}  {}  {}",
-            pad_column("TARGET", target_width),
-            pad_column("STATUS", status_width),
-            pad_column("ENDPOINTS", endpoints_width),
-            "PIDS"
-        );
-        for finding in &inspection.findings {
-            header.push_str(&format!("\nwarning: {finding}"));
-        }
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let result = (|| -> Result<()> {
+        terminal.hide_cursor()?;
+        let outcome = app.run(&mut terminal);
+        terminal.show_cursor()?;
+        outcome
+    })();
+    // Restore the normal screen even when the event loop errored.
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+    result
+}
 
-        let mut fzf = Command::new("fzf");
-        fzf.args([
-            "--delimiter=\\t",
-            "--with-nth=2",
-            "--no-sort",
-            "--reverse",
-            "--info=inline",
-            "--border=rounded",
-            "--ansi",
-            "--prompt=portboard ❯ ",
-            "--expect=enter,ctrl-s,ctrl-r,ctrl-o",
-            "--header",
-            &header,
-            "--footer",
-            PANEL_FOOTER,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-        let mut fzf = fzf.spawn().context("Portboard panel could not start fzf")?;
-
-        {
-            let input = fzf
-                .stdin
-                .as_mut()
-                .context("Portboard panel could not open fzf input")?;
-            for row in &rows {
-                writeln!(
-                    input,
-                    "{}\t{}  {}  {}  {}",
-                    row.id,
-                    pad_column(&row.target, target_width),
-                    pad_column(row.status, status_width),
-                    pad_column(&row.endpoints, endpoints_width),
-                    row.pids
-                )?;
-            }
-        }
-
-        let output = fzf
-            .wait_with_output()
-            .context("Portboard panel could not wait for fzf")?;
-        if !output.status.success() {
-            // fzf uses 1 for no match and 130 for an interrupted/cancelled
-            // selection. Both are normal ways to close a transient panel.
-            if matches!(output.status.code(), Some(1 | 130)) {
-                return Ok(());
-            }
-            bail!("Portboard panel fzf exited with {}", output.status);
-        }
-
-        let selection = String::from_utf8(output.stdout)
-            .context("Portboard panel received a non-UTF-8 fzf selection")?;
-        let mut lines = selection.lines();
-        let key = lines.next().unwrap_or_default();
-        if key == "ctrl-r" {
-            continue;
-        }
-        let selected = lines
-            .next()
-            .filter(|value| !value.is_empty())
-            .context("Portboard panel selection did not contain a launch target")?;
-        let target_id = selected
-            .split('\t')
-            .next()
-            .filter(|value| !value.is_empty())
-            .context("Portboard panel selection did not contain a launch target id")?;
-
-        if key == "ctrl-o" {
-            let status = statuses
-                .iter()
-                .find(|status| status.id.as_str() == target_id)
-                .context("Portboard panel selected an unknown launch target")?;
-            match browser_url(status) {
-                Some(url) => {
-                    let outcome = open_browser_url(&url);
-                    show_endpoint_url_panel(&status.label, &url, outcome)?;
-                }
-                None => open_information_panel(&format!(
-                    "{} has no discovered endpoint to open",
-                    status.label
-                ))?,
-            }
-            continue;
-        }
-
-        if key == "ctrl-s" {
-            let refreshed_config = load_worktree_launch_targets(worktree_root)?;
-            if refreshed_config != config {
-                continue;
-            }
-            let target = config
-                .launch_targets
-                .iter()
-                .find(|target| target.id.as_str() == target_id)
-                .context("Portboard panel selected an unknown launch target")?;
-            let stop_result = match current_herdr_workspace_id() {
-                Some(workspace_id) => {
-                    stop_launch_target_and_close_herdr_tab(worktree_root, target, &workspace_id)
-                }
-                None => stop_launch_target(worktree_root, target),
-            };
-            match stop_result {
-                Ok(_) => continue,
-                Err(error) => {
-                    eprintln!("{error:#}");
-                    continue;
-                }
-            }
-        }
-
-        let refreshed_config = load_worktree_launch_targets(worktree_root)?;
-        if refreshed_config != config {
-            continue;
-        }
-        return open_or_start_launch_target(worktree_root, &config, Some(target_id));
+/// Re-enables raw mode if the panel exits through an early error path.
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
     }
 }
 
-struct PanelRow {
-    id: String,
-    target: String,
-    status: &'static str,
-    endpoints: String,
-    pids: String,
+/// One of the three navigable lists in the panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Targets,
+    Ports,
+    Endpoints,
 }
 
-fn panel_rows(statuses: &[CurrentLaunchTargetStatus]) -> Vec<PanelRow> {
-    statuses
-        .iter()
-        .map(|target| {
-            let (status, pids) = match &target.state {
-                LaunchTargetRuntimeState::Stopped => ("stopped", "—".to_string()),
-                LaunchTargetRuntimeState::Running { processes } if target.duplicate => (
-                    "duplicate!",
-                    processes
-                        .iter()
-                        .map(|process| process.pid.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-                LaunchTargetRuntimeState::Running { processes } => (
-                    "running",
-                    processes
-                        .iter()
-                        .map(|process| process.pid.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-            };
-            let endpoints = if !target.named_endpoints.is_empty() {
-                target
-                    .named_endpoints
-                    .iter()
-                    .map(|endpoint| format!("{} {}", endpoint.id, endpoint.url))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else if target.endpoints.is_empty() {
-                "—".to_string()
-            } else {
-                target
-                    .endpoints
-                    .iter()
-                    .map(|endpoint| {
-                        if endpoint.address.contains(':') {
-                            format!("[{}]:{}", endpoint.address, endpoint.port)
-                        } else {
-                            format!("{}:{}", endpoint.address, endpoint.port)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            PanelRow {
-                id: target.id.as_str().to_string(),
-                target: truncate_column(&target.label, 32),
-                status,
-                endpoints: truncate_column(&endpoints, 42),
-                pids: truncate_column(&pids, 24),
-            }
+impl Focus {
+    fn name(self) -> &'static str {
+        match self {
+            Focus::Targets => "targets",
+            Focus::Ports => "ports",
+            Focus::Endpoints => "endpoints",
+        }
+    }
+}
+
+/// One actionable URL shown in the detail pane.
+struct EndpointRow {
+    label: String,
+    url: String,
+}
+
+/// One discovered listener in the worktree, shown whether or not a manifest
+/// claims its process.
+struct PortRow {
+    label: String,
+    url: String,
+    pid: u32,
+    target: Option<String>,
+    port: u16,
+}
+
+struct PanelApp {
+    worktree_root: PathBuf,
+    inspection: Option<WorktreeLaunchTargetInspection>,
+    inventory: Option<Vec<WorktreeProcessInventoryEntry>>,
+    load_error: Option<String>,
+    selected_target: usize,
+    selected_port: usize,
+    selected_endpoint: usize,
+    focus: Focus,
+    target_list_state: ListState,
+    port_list_state: ListState,
+    endpoint_list_state: ListState,
+    message: Option<String>,
+    last_refresh: Instant,
+    stop_rx: Option<Receiver<Result<Vec<u32>>>>,
+}
+
+impl PanelApp {
+    fn new(worktree_root: &Path) -> Result<Self> {
+        let root = worktree_root.canonicalize().with_context(|| {
+            format!(
+                "Portboard could not resolve worktree {}",
+                worktree_root.display()
+            )
+        })?;
+        Ok(Self {
+            worktree_root: root,
+            inspection: None,
+            inventory: None,
+            load_error: None,
+            selected_target: 0,
+            selected_port: 0,
+            selected_endpoint: 0,
+            focus: Focus::Targets,
+            target_list_state: ListState::default(),
+            port_list_state: ListState::default(),
+            endpoint_list_state: ListState::default(),
+            message: None,
+            last_refresh: Instant::now(),
+            stop_rx: None,
         })
-        .collect()
+    }
+
+    fn has_manifest(&self) -> bool {
+        self.worktree_root.join("portboard.toml").is_file()
+    }
+
+    /// Re-inspects the current worktree. Loaded data is replaced; a failing
+    /// manifest leaves the previous inspection in place and records an error.
+    /// The process inventory is always refreshed so live ports stay visible
+    /// with or without a `portboard.toml`.
+    fn refresh(&mut self) {
+        self.last_refresh = Instant::now();
+        self.load_error = None;
+        let mut targets = Vec::new();
+        if self.has_manifest() {
+            match load_worktree_launch_targets(&self.worktree_root) {
+                Ok(config) => {
+                    targets = config.launch_targets.clone();
+                    match inspect_worktree_launch_targets(&self.worktree_root, &config) {
+                        Ok(inspection) => self.inspection = Some(inspection),
+                        Err(error) => self.load_error = Some(format!("{error:#}")),
+                    }
+                }
+                Err(error) => {
+                    self.inspection = None;
+                    self.load_error = Some(format!("{error:#}"));
+                }
+            }
+        } else {
+            self.inspection = None;
+        }
+        match inspect_worktree_processes(&self.worktree_root, &targets) {
+            Ok(inventory) => self.inventory = Some(inventory),
+            Err(_) => {
+                self.inventory = None;
+                if self.load_error.is_none() {
+                    self.load_error = Some("process scan failed".to_string());
+                }
+            }
+        }
+        self.clamp_selection();
+    }
+
+    fn clamp_selection(&mut self) {
+        let target_count = self.target_count();
+        if self.selected_target >= target_count {
+            self.selected_target = target_count.saturating_sub(1);
+        }
+        let port_count = self.port_rows().len();
+        if self.selected_port >= port_count {
+            self.selected_port = port_count.saturating_sub(1);
+        }
+        let endpoint_count = self.endpoint_rows().len();
+        if self.selected_endpoint >= endpoint_count {
+            self.selected_endpoint = endpoint_count.saturating_sub(1);
+        }
+    }
+
+    /// Every listener discovered in the worktree, sorted by port then pid.
+    fn port_rows(&self) -> Vec<PortRow> {
+        let Some(inventory) = &self.inventory else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for entry in inventory {
+            for endpoint in &entry.endpoints {
+                let host = match endpoint.address.as_str() {
+                    "0.0.0.0" | "127.0.0.1" => "localhost".to_string(),
+                    "::" | "::1" => "[::1]".to_string(),
+                    other if other.contains(':') => format!("[{other}]"),
+                    other => other.to_string(),
+                };
+                rows.push(PortRow {
+                    label: format!(":{}", endpoint.port),
+                    url: format!("http://{host}:{}", endpoint.port),
+                    pid: entry.pid,
+                    target: entry.target_ids.first().cloned(),
+                    port: endpoint.port,
+                });
+            }
+        }
+        rows.sort_by_key(|row| (row.port, row.pid));
+        rows.dedup_by(|a, b| a.url == b.url && a.pid == b.pid);
+        rows
+    }
+
+    fn target_count(&self) -> usize {
+        self.inspection
+            .as_ref()
+            .map(|inspection| inspection.statuses.len())
+            .unwrap_or(0)
+    }
+
+    fn selected_status(&self) -> Option<&CurrentLaunchTargetStatus> {
+        self.inspection
+            .as_ref()
+            .and_then(|inspection| inspection.statuses.get(self.selected_target))
+    }
+
+    fn endpoint_rows(&self) -> Vec<EndpointRow> {
+        let Some(status) = self.selected_status() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for endpoint in &status.named_endpoints {
+            rows.push(EndpointRow {
+                label: endpoint.id.clone(),
+                url: endpoint.url.clone(),
+            });
+        }
+        if rows.is_empty() {
+            for endpoint in &status.endpoints {
+                let address = if endpoint.address.contains(':') {
+                    format!("[{}]", endpoint.address)
+                } else {
+                    endpoint.address.clone()
+                };
+                rows.push(EndpointRow {
+                    label: format!("tcp {address}:{}", endpoint.port),
+                    url: format!("http://{address}:{}", endpoint.port),
+                });
+            }
+        }
+        rows
+    }
+
+    fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+        loop {
+            terminal.draw(|frame| self.render(frame))?;
+            let has_input = event::poll(Duration::from_millis(200))
+                .context("Portboard panel could not poll for input")?;
+            if has_input {
+                let event = event::read().context("Portboard panel could not read input")?;
+                if matches!(self.handle_event(event)?, Some(true)) {
+                    return Ok(());
+                }
+            }
+            if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+                self.refresh();
+            }
+            if let Some(message) = self.poll_stop() {
+                self.message = Some(message);
+            }
+        }
+    }
+
+    /// Returns `Ok(Some(true))` when the panel should close.
+    fn handle_event(&mut self, event: Event) -> Result<Option<bool>> {
+        match event {
+            Event::Key(key)
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat =>
+            {
+                match key.code {
+                    KeyCode::Char('q') => return Ok(Some(true)),
+                    KeyCode::Esc => {
+                        // esc steps focus back one list before closing.
+                        self.focus = match self.focus {
+                            Focus::Endpoints => Focus::Ports,
+                            Focus::Ports => Focus::Targets,
+                            Focus::Targets => return Ok(Some(true)),
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if self.focus == Focus::Endpoints {
+                            self.open_endpoint(self.selected_endpoint);
+                        } else {
+                            return self.open_or_start();
+                        }
+                    }
+                    KeyCode::Char('o') => match self.focus {
+                        Focus::Endpoints => self.open_endpoint(self.selected_endpoint),
+                        Focus::Ports => self.open_port(self.selected_port),
+                        Focus::Targets => self.open_primary(),
+                    },
+                    KeyCode::Char('y') => match self.focus {
+                        Focus::Endpoints => self.copy_endpoint(self.selected_endpoint),
+                        Focus::Ports => self.copy_port(self.selected_port),
+                        Focus::Targets => self.copy_primary(),
+                    },
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        if self.focus == Focus::Targets {
+                            self.start_stop();
+                        }
+                    }
+                    KeyCode::Char('r') => self.refresh(),
+                    KeyCode::Tab | KeyCode::Right | KeyCode::Left => self.toggle_focus(),
+                    KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                    KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+                    _ => {}
+                }
+                Ok(None)
+            }
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Resize(_, _) => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    /// Cycles focus through targets, ports, and endpoints.
+    fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Targets => Focus::Ports,
+            Focus::Ports => Focus::Endpoints,
+            Focus::Endpoints => Focus::Targets,
+        };
+    }
+
+    fn move_selection(&mut self, delta: i64) {
+        match self.focus {
+            Focus::Targets => {
+                let len = self.target_count() as i64;
+                let next = (self.selected_target as i64 + delta).clamp(0, (len - 1).max(0));
+                self.selected_target = next as usize;
+                self.selected_endpoint = 0;
+            }
+            Focus::Ports => {
+                let len = self.port_rows().len() as i64;
+                let next = (self.selected_port as i64 + delta).clamp(0, (len - 1).max(0));
+                self.selected_port = next as usize;
+            }
+            Focus::Endpoints => {
+                let len = self.endpoint_rows().len() as i64;
+                let next = (self.selected_endpoint as i64 + delta).clamp(0, (len - 1).max(0));
+                self.selected_endpoint = next as usize;
+            }
+        }
+    }
+
+    /// Opens or starts the selected target, then closes the panel.
+    fn open_or_start(&mut self) -> Result<Option<bool>> {
+        let Some(status) = self.selected_status().cloned() else {
+            return Ok(None);
+        };
+        let config = load_worktree_launch_targets(&self.worktree_root);
+        let (config, message) = match config {
+            Ok(config) => (Some(config), format!("{}: open/start…", status.label)),
+            Err(error) => {
+                self.message = Some(format!("{error:#}"));
+                return Ok(None);
+            }
+        };
+        let config = config.expect("unreachable");
+        self.message = Some(message);
+        match open_or_start_launch_target(&self.worktree_root, &config, Some(status.id.as_str())) {
+            Ok(()) => Ok(Some(true)),
+            Err(error) => {
+                self.message = Some(format!("{error:#}"));
+                Ok(None)
+            }
+        }
+    }
+
+    fn open_endpoint(&mut self, index: usize) {
+        if let Some(row) = self.endpoint_rows().get(index) {
+            self.message = Some(open_message(row.url.as_str()));
+        }
+    }
+
+    fn open_port(&mut self, index: usize) {
+        if let Some(row) = self.port_rows().get(index) {
+            self.message = Some(open_message(row.url.as_str()));
+        }
+    }
+
+    fn open_primary(&mut self) {
+        let Some(status) = self.selected_status() else {
+            return;
+        };
+        match browser_url(status) {
+            Some(url) => self.message = Some(open_message(url.as_str())),
+            None => self.message = Some("no endpoint URL to open".to_string()),
+        }
+    }
+
+    fn copy_endpoint(&mut self, index: usize) {
+        if let Some(row) = self.endpoint_rows().get(index) {
+            self.message = Some(copy_message(row.url.as_str()));
+        }
+    }
+
+    fn copy_port(&mut self, index: usize) {
+        if let Some(row) = self.port_rows().get(index) {
+            self.message = Some(copy_message(row.url.as_str()));
+        }
+    }
+
+    fn copy_primary(&mut self) {
+        let Some(status) = self.selected_status() else {
+            return;
+        };
+        match browser_url(status) {
+            Some(url) => self.message = Some(copy_message(url.as_str())),
+            None => self.message = Some("no endpoint URL to copy".to_string()),
+        }
+    }
+
+    fn start_stop(&mut self) {
+        if self.stop_rx.is_some() {
+            return;
+        }
+        let Ok(config) = load_worktree_launch_targets(&self.worktree_root) else {
+            self.message = Some("could not reload manifest to stop".to_string());
+            return;
+        };
+        let Some(status) = self.selected_status().cloned() else {
+            return;
+        };
+        let Some(target) = config
+            .launch_targets
+            .iter()
+            .find(|target| target.id.as_str() == status.id.as_str())
+            .cloned()
+        else {
+            return;
+        };
+        let root = self.worktree_root.clone();
+        let workspace_id = current_herdr_workspace_id();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = match workspace_id {
+                Some(workspace_id) => {
+                    stop_launch_target_and_close_herdr_tab(&root, &target, &workspace_id)
+                }
+                None => stop_launch_target(&root, &target),
+            };
+            let _ = sender.send(result);
+        });
+        self.stop_rx = Some(receiver);
+        self.message = Some(format!("{}: stopping…", status.label));
+    }
+
+    fn poll_stop(&mut self) -> Option<String> {
+        let receiver = self.stop_rx.as_ref()?;
+        let message = match receiver.try_recv() {
+            Ok(result) => match result {
+                Ok(pids) if pids.is_empty() => "already stopped".to_string(),
+                Ok(pids) => format!(
+                    "stopping pid {}",
+                    pids.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Err(error) => format!("{error:#}"),
+            },
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => "stop worker disconnected".to_string(),
+        };
+        self.stop_rx = None;
+        Some(message)
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
+        let (width, height) =
+            crossterm::terminal::size().context("Portboard panel could not read terminal size")?;
+        let area = Rect::new(0, 0, width, height);
+        let areas = layout_areas(area);
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if rect_contains(areas.targets, point) {
+                    let index = mouse.row.saturating_sub(areas.targets.y) as usize;
+                    if index < self.target_count() {
+                        self.selected_target = index;
+                        self.selected_endpoint = 0;
+                        self.focus = Focus::Targets;
+                    }
+                } else if rect_contains(areas.ports, point) {
+                    let index = mouse.row.saturating_sub(areas.ports.y) as usize;
+                    if index < self.port_rows().len() {
+                        self.selected_port = index;
+                        self.focus = Focus::Ports;
+                        self.open_port(index);
+                    }
+                } else if rect_contains(areas.endpoints, point) {
+                    let index = mouse.row.saturating_sub(areas.endpoints.y) as usize;
+                    if index < self.endpoint_rows().len() {
+                        self.selected_endpoint = index;
+                        self.focus = Focus::Endpoints;
+                        self.open_endpoint(index);
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => self.move_selection(-1),
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        let areas = layout_areas(frame.area());
+        self.target_list_state.select(Some(self.selected_target));
+        self.port_list_state.select(Some(self.selected_port));
+        self.endpoint_list_state
+            .select(Some(self.selected_endpoint));
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Portboard",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {}", self.worktree_root.display()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])),
+            areas.header,
+        );
+
+        if !self.has_manifest() {
+            self.render_no_manifest(frame, &areas);
+        } else {
+            self.render_manifest(frame, &areas);
+        }
+
+        frame.render_widget(self.footer(), areas.footer);
+    }
+
+    fn render_manifest(&mut self, frame: &mut Frame, areas: &Areas) {
+        if self.target_count() == 0 {
+            let text = self
+                .load_error
+                .as_deref()
+                .unwrap_or("portboard.toml is present but declares no launch targets");
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(Color::Yellow),
+                )))
+                .block(Block::new().borders(Borders::ALL).title(" portboard "))
+                .wrap(Wrap { trim: false }),
+                areas.body,
+            );
+            return;
+        }
+
+        let targets = List::new(self.target_items())
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(" targets ", self.pane_title_style(Focus::Targets)))
+                    .border_style(self.pane_border_style(Focus::Targets)),
+            )
+            .highlight_style(self.pane_highlight_style(Focus::Targets))
+            .highlight_symbol(if self.focus == Focus::Targets {
+                "▸ "
+            } else {
+                "  "
+            });
+        frame.render_stateful_widget(targets, areas.targets_block, &mut self.target_list_state);
+
+        let port_count = self.port_rows().len();
+        let ports_title = format!(" ports ({port_count}) ");
+        let ports = List::new(self.port_items())
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(ports_title, self.pane_title_style(Focus::Ports)))
+                    .border_style(self.pane_border_style(Focus::Ports)),
+            )
+            .highlight_style(self.pane_highlight_style(Focus::Ports))
+            .highlight_symbol(if self.focus == Focus::Ports {
+                "▸ "
+            } else {
+                "  "
+            });
+        frame.render_stateful_widget(ports, areas.ports_block, &mut self.port_list_state);
+
+        frame.render_widget(self.info_paragraph(), areas.info_block);
+
+        let endpoints = List::new(self.endpoint_items())
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .title(Line::from(vec![
+                        Span::styled(" endpoints ", self.pane_title_style(Focus::Endpoints)),
+                        Span::styled(
+                            "(click or enter to open · y to copy)",
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                    .border_style(self.pane_border_style(Focus::Endpoints)),
+            )
+            .highlight_style(self.pane_highlight_style(Focus::Endpoints))
+            .highlight_symbol(if self.focus == Focus::Endpoints {
+                "▸ "
+            } else {
+                "  "
+            });
+        frame.render_stateful_widget(
+            endpoints,
+            areas.endpoints_block,
+            &mut self.endpoint_list_state,
+        );
+    }
+
+    fn render_no_manifest(&mut self, frame: &mut Frame, areas: &Areas) {
+        let inventory = self.inventory.clone().unwrap_or_default();
+        let mut items = Vec::new();
+        if inventory.is_empty() {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "no live processes in this worktree",
+                Style::default().fg(Color::DarkGray),
+            ))));
+        } else {
+            for entry in inventory.iter() {
+                let ports = if entry.endpoints.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  {}",
+                        entry
+                            .endpoints
+                            .iter()
+                            .map(|endpoint| format!(":{}", endpoint.port))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        pad(&entry.pid.to_string(), 7),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(ports, Style::default().fg(Color::Cyan)),
+                    Span::raw(format!("  {}", truncate(&entry.argv.join(" "), 80))),
+                ])));
+            }
+        }
+        let title = format!(
+            " {} processes running · no portboard.toml in {} ",
+            inventory.len(),
+            self.worktree_root.display()
+        );
+        let list = List::new(items).block(Block::new().borders(Borders::ALL).title(title));
+        frame.render_widget(list, areas.body);
+    }
+
+    fn target_items(&self) -> Vec<ListItem<'static>> {
+        let Some(inspection) = &self.inspection else {
+            return Vec::new();
+        };
+        inspection
+            .statuses
+            .iter()
+            .map(|status| {
+                let (word, color) = match &status.state {
+                    LaunchTargetRuntimeState::Stopped => ("stopped", Color::DarkGray),
+                    LaunchTargetRuntimeState::Running { .. } if status.duplicate => {
+                        ("duplicate!", Color::Red)
+                    }
+                    LaunchTargetRuntimeState::Running { .. } => ("running", Color::Green),
+                };
+                let pid_text = match &status.state {
+                    LaunchTargetRuntimeState::Running { processes } => format!(
+                        "  pid {}",
+                        processes
+                            .iter()
+                            .map(|process| process.pid.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    LaunchTargetRuntimeState::Stopped => String::new(),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(pad(&status.label, 24)),
+                    Span::styled(word, Style::default().fg(color)),
+                    Span::styled(pid_text, Style::default().fg(Color::DarkGray)),
+                ]))
+            })
+            .collect()
+    }
+
+    fn endpoint_items(&self) -> Vec<ListItem<'static>> {
+        self.endpoint_rows()
+            .into_iter()
+            .map(|row| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(pad(&row.label, 8), Style::default().fg(Color::Cyan)),
+                    Span::raw(format!("  {}", row.url)),
+                ]))
+            })
+            .collect()
+    }
+
+    fn port_items(&self) -> Vec<ListItem<'static>> {
+        self.port_rows()
+            .into_iter()
+            .map(|row| {
+                let mut spans = vec![
+                    Span::styled(pad(&row.label, 7), Style::default().fg(Color::Cyan)),
+                    Span::raw(format!("  {}", row.url)),
+                    Span::styled(
+                        format!("  pid {}", row.pid),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
+                if let Some(target) = row.target {
+                    spans.push(Span::styled(
+                        format!(" · {target}"),
+                        Style::default().fg(Color::Green),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect()
+    }
+
+    fn info_paragraph(&self) -> Paragraph<'static> {
+        let status = self.selected_status();
+        let mut lines = Vec::new();
+        match status {
+            Some(status) => {
+                match &status.state {
+                    LaunchTargetRuntimeState::Stopped => lines.push(Line::from(vec![
+                        Span::styled("state", Style::default().fg(Color::DarkGray)),
+                        Span::raw("  stopped"),
+                    ])),
+                    LaunchTargetRuntimeState::Running { processes } => {
+                        let (word, color) = if status.duplicate {
+                            (
+                                format!("running · DUPLICATE ({} instances)", processes.len()),
+                                Color::Red,
+                            )
+                        } else {
+                            ("running".to_string(), Color::Green)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("state", Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!("  {word}"), Style::default().fg(color)),
+                            Span::styled(
+                                format!(
+                                    "  pid {}",
+                                    processes
+                                        .iter()
+                                        .map(|process| process.pid.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("argv ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!(" {}", status.argv.join(" "))),
+                ]));
+            }
+            None => {
+                if let Some(error) = &self.load_error {
+                    lines.push(Line::from(Span::styled(
+                        error.clone(),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+        }
+        let title = match status {
+            Some(status) => format!(" {} ", status.label),
+            None => " detail ".to_string(),
+        };
+        // The detail header belongs to the same right-hand column as the
+        // endpoints list, so it lights up with the endpoints focus.
+        Paragraph::new(lines)
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(title, self.pane_title_style(Focus::Endpoints)))
+                    .border_style(self.pane_border_style(Focus::Endpoints)),
+            )
+            .wrap(Wrap { trim: false })
+    }
+
+    /// Border color for a pane: bright cyan when focused, dimmed otherwise.
+    fn pane_border_style(&self, focus: Focus) -> Style {
+        if self.focus == focus {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    }
+
+    /// Title style for a pane: bold cyan when focused, dimmed otherwise.
+    fn pane_title_style(&self, focus: Focus) -> Style {
+        if self.focus == focus {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    }
+
+    /// Selected-row style: reversed in the focused pane so the cursor pops,
+    /// subdued dark gray elsewhere so it stays visible without competing.
+    fn pane_highlight_style(&self, focus: Focus) -> Style {
+        if self.focus == focus {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    }
+
+    fn footer(&self) -> Paragraph<'static> {
+        let mut lines = Vec::new();
+        if let Some(message) = &self.message {
+            lines.push(Line::from(Span::styled(
+                format!(" {message}"),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        if let Some(inspection) = &self.inspection {
+            for finding in &inspection.findings {
+                lines.push(Line::from(Span::styled(
+                    format!(" warning: {finding}"),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+        lines.push(Line::from(Span::styled(
+            format!(" focus {} · ", self.focus.name()),
+            Style::default().fg(Color::Cyan),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(" {KEY_HINTS}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        Paragraph::new(lines).block(Block::new())
+    }
 }
 
-fn column_width<'a>(heading: &str, values: impl Iterator<Item = &'a str>) -> usize {
-    values
-        .map(|value| value.chars().count())
-        .max()
-        .unwrap_or_default()
-        .max(heading.chars().count())
+fn open_message(url: &str) -> String {
+    match open_browser_url(url) {
+        UrlOpenOutcome::OpenedLocally => format!("opens {url} in your browser"),
+        UrlOpenOutcome::OfferedLink => {
+            format!("ctrl-click {url} above to open it in your local browser")
+        }
+    }
 }
 
-fn pad_column(value: &str, width: usize) -> String {
+fn copy_message(url: &str) -> String {
+    if copy_url_to_clipboard(url) {
+        format!("copied {url} to clipboard")
+    } else {
+        format!("{url} (terminal does not support OSC 52 copy; select the text instead)")
+    }
+}
+
+fn pad(value: &str, width: usize) -> String {
     let padding = width.saturating_sub(value.chars().count());
     format!("{value}{}", " ".repeat(padding))
 }
 
-fn truncate_column(value: &str, width: usize) -> String {
+fn truncate(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_string();
     }
@@ -262,73 +940,82 @@ fn truncate_column(value: &str, width: usize) -> String {
     truncated
 }
 
-/// Shows one launch target URL as a clickable link, then returns to the panel.
-fn show_endpoint_url_panel(label: &str, url: &str, outcome: UrlOpenOutcome) -> Result<()> {
-    // No --ansi here: fzf would strip the OSC 8 hyperlink escape sequence, and
-    // Herdr needs it (or the visible URL) intact for ctrl-click opening.
-    let mut fzf = Command::new("fzf")
-        .args([
-            "--disabled",
-            "--no-sort",
-            "--reverse",
-            "--info=inline",
-            "--border=rounded",
-            "--prompt=portboard ❯ ",
-            "--footer",
-            URL_FOOTER,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .context("Portboard panel could not start fzf")?;
-    {
-        let input = fzf
-            .stdin
-            .as_mut()
-            .context("Portboard panel could not open fzf input")?;
-        match outcome {
-            UrlOpenOutcome::OpenedLocally => writeln!(input, "{label} opened in your browser")?,
-            UrlOpenOutcome::OfferedLink => writeln!(input, "{label}")?,
-        }
-        writeln!(input, "{}", osc8_hyperlink(url))?;
-    }
-    let status = fzf
-        .wait()
-        .context("Portboard panel could not wait for fzf")?;
-    if status.success() || matches!(status.code(), Some(1 | 130)) {
-        return Ok(());
-    }
-    bail!("Portboard panel fzf exited with {status}")
+struct Areas {
+    header: Rect,
+    body: Rect,
+    footer: Rect,
+    targets_block: Rect,
+    targets: Rect,
+    ports_block: Rect,
+    ports: Rect,
+    info_block: Rect,
+    endpoints_block: Rect,
+    endpoints: Rect,
 }
 
-fn open_information_panel(message: &str) -> Result<()> {
-    let mut fzf = Command::new("fzf")
-        .args([
-            "--disabled",
-            "--no-sort",
-            "--reverse",
-            "--info=inline",
-            "--border=rounded",
-            "--ansi",
-            "--prompt=portboard ❯ ",
-            "--footer",
-            INFORMATION_FOOTER,
+/// Splits the terminal into a header, body, and a fixed-height footer. The
+/// body is then split into a left column (targets above the always-visible
+/// worktree-wide ports list) and a right detail column, whose endpoints list
+/// occupies the space below the detail header.
+fn layout_areas(area: Rect) -> Areas {
+    let footer_height = 3u16;
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .context("Portboard panel could not start fzf")?;
-    writeln!(
-        fzf.stdin
-            .as_mut()
-            .context("Portboard panel could not open fzf input")?,
-        "{message}"
-    )?;
-    let status = fzf
-        .wait()
-        .context("Portboard panel could not wait for fzf")?;
-    if status.success() || matches!(status.code(), Some(1 | 130)) {
-        return Ok(());
+        .split(area);
+    let (header, body, footer) = (vertical[0], vertical[1], vertical[2]);
+
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(body);
+    let (left, right) = (horizontal[0], horizontal[1]);
+
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(left);
+    let (targets_block, ports_block) = (left_rows[0], left_rows[1]);
+    let targets = inner_rect(targets_block);
+    let ports = inner_rect(ports_block);
+
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .split(right);
+    let (info_block, endpoints_block) = (detail[0], detail[1]);
+    let endpoints = inner_rect(endpoints_block);
+
+    Areas {
+        header,
+        body,
+        footer,
+        targets_block,
+        targets,
+        ports_block,
+        ports,
+        info_block,
+        endpoints_block,
+        endpoints,
     }
-    bail!("Portboard panel fzf exited with {status}")
+}
+
+fn inner_rect(block: Rect) -> Rect {
+    Rect {
+        x: block.x + 1,
+        y: block.y + 1,
+        width: block.width.saturating_sub(2),
+        height: block.height.saturating_sub(2),
+    }
+}
+
+fn rect_contains(rect: Rect, (x, y): (u16, u16)) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
 }

@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::current_workspace_status::inspect_worktree_launch_targets;
@@ -16,9 +16,6 @@ use crate::launch_target_config::{load_worktree_launch_targets, LaunchTarget};
 use crate::launch_target_lock::LaunchTargetLock;
 use crate::launch_target_processes::find_launch_target_processes;
 use crate::launch_target_stop::stop_launch_target;
-use crate::manifest_approval::{
-    approve_launch_target, current_manifest_snapshot, launch_target_is_approved,
-};
 use crate::state_paths::worktree_state_directory;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:9777";
@@ -65,7 +62,7 @@ fn is_loopback_bind_address(address: &str) -> bool {
 }
 
 fn handle_request(
-    mut request: Request,
+    request: Request,
     state: &mut DashboardState,
     token: &str,
     allowed_hosts: &[String],
@@ -107,26 +104,15 @@ fn handle_request(
             )),
             (Method::Get, "/api/status") => {
                 let config = load_worktree_launch_targets(&state.worktree_root)?;
-                let manifest = current_manifest_snapshot(&state.worktree_root, &config)?;
                 let inspection = inspect_worktree_launch_targets(&state.worktree_root, &config)?;
                 let targets = inspection
                     .statuses
                     .iter()
                     .zip(config.launch_targets.iter())
-                    .map(|(status, target)| {
-                        Ok(DashboardTargetStatus {
-                            status,
-                            approved: launch_target_is_approved(
-                                &state.worktree_root,
-                                &config,
-                                target,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    .map(|(status, _target)| DashboardTargetStatus { status })
+                    .collect::<Vec<_>>();
                 let status = DashboardStatus {
                     worktree_root: state.worktree_root.to_string_lossy().into_owned(),
-                    manifest: &manifest,
                     findings: &inspection.findings,
                     targets,
                 };
@@ -134,22 +120,6 @@ fn handle_request(
                     StatusCode(200),
                     "application/json; charset=utf-8",
                     serde_json::to_string_pretty(&status)?,
-                ))
-            }
-            (Method::Post, path) if path.starts_with("/api/approve/") => {
-                let target_id = &path["/api/approve/".len()..];
-                let mut body = String::new();
-                request
-                    .as_reader()
-                    .read_to_string(&mut body)
-                    .context("Portboard dashboard could not read approval request")?;
-                let approval: ApprovalRequest = serde_json::from_str(&body)
-                    .context("Portboard dashboard received an invalid approval request")?;
-                let result = state.approve_target(target_id, &approval.argv, &approval.manifest)?;
-                Ok((
-                    StatusCode(200),
-                    "application/json; charset=utf-8",
-                    serde_json::to_string_pretty(&result)?,
                 ))
             }
             (Method::Post, path) if path.starts_with("/api/open/") => {
@@ -261,23 +231,6 @@ impl DashboardState {
         })
     }
 
-    fn approve_target(
-        &self,
-        target_id: &str,
-        expected_argv: &[String],
-        expected_manifest: &str,
-    ) -> Result<ApiMessage> {
-        let config = load_worktree_launch_targets(&self.worktree_root)?;
-        let target = find_target(&config.launch_targets, target_id)?;
-        if target.argv != expected_argv {
-            bail!("Portboard manifest changed after the command was displayed; refresh and review it again");
-        }
-        approve_launch_target(&self.worktree_root, &config, target, expected_manifest)?;
-        Ok(ApiMessage {
-            message: "approved".to_string(),
-        })
-    }
-
     fn start_target(&mut self, target_id: &str) -> Result<StartResult> {
         if let Some(child) = self.children.get_mut(target_id) {
             let child_running = child
@@ -313,10 +266,6 @@ impl DashboardState {
                 pid: None,
                 log_path: None,
             });
-        }
-
-        if !launch_target_is_approved(&self.worktree_root, &config, target)? {
-            bail!("Portboard launch target `{target_id}` needs approval before it can start");
         }
 
         let (log_path, log) = rotate_log(&self.log_directory, target.id.as_str())?;
@@ -521,17 +470,9 @@ fn request_token() -> Result<String> {
     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApprovalRequest {
-    argv: Vec<String>,
-    manifest: String,
-}
-
 #[derive(Serialize)]
 struct DashboardStatus<'a> {
     worktree_root: String,
-    manifest: &'a str,
     findings: &'a [String],
     targets: Vec<DashboardTargetStatus<'a>>,
 }
@@ -540,7 +481,6 @@ struct DashboardStatus<'a> {
 struct DashboardTargetStatus<'a> {
     #[serde(flatten)]
     status: &'a crate::current_workspace_status::CurrentLaunchTargetStatus,
-    approved: bool,
 }
 
 #[derive(Serialize)]
@@ -617,11 +557,6 @@ async function refresh() {{
       button.onclick = async () => {{
         button.disabled = true;
         try {{
-          if (!running && !target.approved) {{
-            const argv = JSON.stringify(target.argv);
-            if (!confirm(`Approve repository command?\n\ncwd: ${{data.worktree_root}}\nargv: ${{argv}}`)) {{ button.disabled = false; return; }}
-            await api(`/api/approve/${{target.id}}`, {{method:'POST', body: JSON.stringify({{argv: target.argv, manifest: data.manifest}})}});
-          }}
           await api(`/api/${{running ? 'stop' : 'open'}}/${{target.id}}`, {{method:'POST'}});
           await refresh();
         }} catch (error) {{ errorBox.textContent = error.message; button.disabled = false; }}

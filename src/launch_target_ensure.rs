@@ -14,7 +14,6 @@ use crate::launch_target_processes::{
 use crate::launch_target_readiness::{
     wait_for_launch_target_process, wait_for_launch_target_ready,
 };
-use crate::manifest_approval::ensure_launch_target_approved;
 use crate::runtime_metadata::RuntimeEndpoint;
 
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -69,7 +68,6 @@ pub fn ensure_launch_target_in_herdr(
         });
     }
 
-    ensure_launch_target_approved(worktree_root, config, target)?;
     let launcher_pid = launch_target_in_herdr(worktree_root, &workspace_id, target, false)?;
     launch_lock.reserve_process(launcher_pid)?;
     drop(launch_lock);

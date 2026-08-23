@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -47,7 +48,10 @@ pub fn find_launch_target_processes(
     Ok(matches)
 }
 
-/// Scans `/proc` for every live process whose cwd is inside the canonical worktree.
+/// Scans `/proc` for every live process whose cwd is inside the canonical
+/// worktree. Processes running in *other* Git worktrees of the same repository
+/// are excluded even when their paths sit below the root (for example
+/// `<root>/.worktrees/<name>`), so one worktree's stack never claims another's.
 pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProcess>> {
     let canonical_root = worktree_root.canonicalize().with_context(|| {
         format!(
@@ -55,6 +59,7 @@ pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProce
             worktree_root.display()
         )
     })?;
+    let other_worktrees = sibling_git_worktrees(&canonical_root);
     let mut matches = Vec::new();
 
     for entry in fs::read_dir("/proc").context("Portboard process scan could not read /proc")? {
@@ -79,7 +84,11 @@ pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProce
         let Ok(cwd) = fs::read_link(process_path.join("cwd")) else {
             continue;
         };
-        if !cwd.starts_with(&canonical_root) {
+        if !cwd.starts_with(&canonical_root)
+            || other_worktrees
+                .iter()
+                .any(|worktree| cwd.starts_with(worktree))
+        {
             continue;
         }
         let Ok(command_line) = fs::read(process_path.join("cmdline")) else {
@@ -119,6 +128,28 @@ pub fn process_has_portboard_target_identity(
         .any(|entry| entry == expected.as_bytes())
 }
 
+/// Lists the repository's other Git worktrees whose paths sit below the root.
+/// Returns an empty list outside a Git repository or when `git` is unavailable,
+/// which keeps the scan working for plain directories.
+fn sibling_git_worktrees(canonical_root: &Path) -> Vec<PathBuf> {
+    let Ok(output) = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(canonical_root)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .filter(|path| path != canonical_root && path.starts_with(canonical_root))
+        .collect()
+}
+
 fn process_argument_matches(argument: &str, expected: &str) -> bool {
     argument == expected || Path::new(argument).ends_with(Path::new(expected))
 }
@@ -138,11 +169,18 @@ fn read_process_start_time(process_path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use crate::launch_target_config::parse_launch_target_config;
-
     use super::{find_launch_target_processes, process_has_portboard_target_identity};
+
+    /// Creates the directory so the git fixtures below have a stable parent.
+    fn fs_err_create(path: &Path) {
+        fs::create_dir_all(path).expect("repository directory");
+    }
+
+    use crate::launch_target_config::parse_launch_target_config;
 
     #[test]
     fn does_not_report_the_scanner_as_a_target_process() {
@@ -204,6 +242,64 @@ process_match = ["{marker}"]
 
         child.kill().expect("stop shell process");
         child.wait().expect("reap shell process");
+        assert!(!processes.iter().any(|process| process.pid == child.id()));
+    }
+
+    #[test]
+    fn ignores_processes_running_in_a_nested_git_worktree() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        fs_err_create(repository.path());
+        let run_git = |arguments: &[&str]| {
+            Command::new("git")
+                .args(["-c", "user.email=t@l", "-c", "user.name=t"])
+                .arg("-C")
+                .arg(repository.path())
+                .args(arguments)
+                .output()
+                .expect("git")
+        };
+        assert!(run_git(&["init", "-b", "main"]).status.success());
+        fs::write(repository.path().join("file"), "content").expect("commit input");
+        assert!(run_git(&["add", "file"]).status.success());
+        assert!(run_git(&["commit", "-m", "init"]).status.success());
+        let nested = repository.path().join(".worktrees/embed-tests");
+        assert!(run_git(&[
+            "worktree",
+            "add",
+            nested.to_str().expect("nested path"),
+            "-b",
+            "embed-tests"
+        ])
+        .status
+        .success());
+
+        let marker = format!("portboard-nested-worktree-{}", std::process::id());
+        let config = parse_launch_target_config(&format!(
+            r#"
+version = 1
+[[launch_targets]]
+id = "test-server"
+label = "Test server"
+argv = ["sleep", "30"]
+process_match = ["{marker}"]
+"#
+        ))
+        .expect("launch target config");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&nested)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("nested worktree process");
+
+        // The scanner runs against the *main* checkout while the process sits
+        // in the nested worktree below it.
+        let processes = find_launch_target_processes(repository.path(), &config.launch_targets[0])
+            .expect("process scan");
+
+        child.kill().expect("stop nested process");
+        child.wait().expect("reap nested process");
         assert!(!processes.iter().any(|process| process.pid == child.id()));
     }
 

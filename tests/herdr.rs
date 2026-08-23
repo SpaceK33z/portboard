@@ -87,7 +87,6 @@ esac
         .args(["ensure", "probe", "--herdr", "--cwd"])
         .arg(repository.path())
         .env("PORTBOARD_STATE_DIR", state.path())
-        .env("PORTBOARD_APPROVE", "1")
         .env("HERDR_WORKSPACE_ID", "w1")
         .env("HERDR_BIN_PATH", &fake)
         .env_remove("PORTBOARD_WORKSPACE_ID")
@@ -338,6 +337,18 @@ process_match = ["signature-that-has-not-appeared"]
         .env("PORTBOARD_TARGET_ID", "probe")
         .spawn()
         .expect("reserved launcher");
+    // The fake Herdr below reports this real ancestor as the pane shell so the
+    // tab lookup can walk the launcher's ancestry, while the launched command
+    // itself stays a distinct foreground process.
+    let shell_pid = std::fs::read_to_string(format!("/proc/{}/stat", launcher.id()))
+        .expect("launcher stat")
+        .rsplit_once(')')
+        .expect("stat comm")
+        .1
+        .split_whitespace()
+        .nth(1)
+        .and_then(|field| field.parse::<u32>().ok())
+        .expect("parent pid");
     let state = tempfile::tempdir().expect("temporary state");
     let fake = state.path().join("fake-herdr");
     let log = state.path().join("herdr.log");
@@ -354,7 +365,7 @@ case "$1 $2" in
 esac
 "#,
             log.display(),
-            launcher.id(),
+            shell_pid,
             launcher.id()
         ),
     )
@@ -365,7 +376,6 @@ esac
         .args(["ensure", "probe", "--herdr", "--cwd"])
         .arg(repository.path())
         .env("PORTBOARD_STATE_DIR", state.path())
-        .env("PORTBOARD_APPROVE", "1")
         .env("HERDR_WORKSPACE_ID", "w1")
         .env("HERDR_BIN_PATH", &fake)
         .env_remove("PORTBOARD_WORKSPACE_ID")
@@ -440,7 +450,6 @@ esac
         .args(["open", "probe", "--cwd"])
         .arg(repository.path())
         .env("PORTBOARD_STATE_DIR", state.path())
-        .env("PORTBOARD_APPROVE", "1")
         .env("HERDR_WORKSPACE_ID", "w1")
         .env("HERDR_BIN_PATH", &fake)
         .env_remove("PORTBOARD_WORKSPACE_ID")

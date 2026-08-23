@@ -157,41 +157,11 @@ process_match = ["{marker}"]
         None,
         "",
     );
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
     let status: serde_json::Value =
         serde_json::from_str(response_body(&status)).expect("status JSON");
-    let approval = serde_json::json!({
-        "argv": status["targets"][0]["argv"],
-        "manifest": status["manifest"],
-    })
-    .to_string();
-
-    let changed_manifest = manifest.replace("label = \"Probe\"", "label = \"Changed\"");
-    fs::write(repository.path().join("portboard.toml"), changed_manifest)
-        .expect("changed manifest");
-    let stale_approval = request(
-        first_port,
-        &format!("127.0.0.1:{first_port}"),
-        "POST",
-        "/api/approve/probe",
-        Some(&first_token),
-        &approval,
-    );
-    assert!(
-        stale_approval.starts_with("HTTP/1.1 500"),
-        "{stale_approval}"
-    );
-    assert!(stale_approval.contains("manifest changed"));
-    fs::write(repository.path().join("portboard.toml"), &manifest).expect("restored manifest");
-
-    let approved = request(
-        first_port,
-        &format!("127.0.0.1:{first_port}"),
-        "POST",
-        "/api/approve/probe",
-        Some(&first_token),
-        &approval,
-    );
-    assert!(approved.starts_with("HTTP/1.1 200"), "{approved}");
+    assert_eq!(status["targets"][0]["id"], "probe");
+    assert_eq!(status["manifest"], serde_json::Value::Null);
 
     let first_host = format!("127.0.0.1:{first_port}");
     let second_host = format!("127.0.0.1:{second_port}");

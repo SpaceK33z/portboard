@@ -13,7 +13,6 @@ pub mod launch_target_open;
 pub mod launch_target_processes;
 pub mod launch_target_readiness;
 pub mod launch_target_stop;
-pub mod manifest_approval;
 pub mod portboard_cli;
 pub mod process_endpoints;
 pub mod runtime_metadata;

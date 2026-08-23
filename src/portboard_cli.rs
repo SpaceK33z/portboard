@@ -22,7 +22,6 @@ use crate::launch_target_ensure::{ensure_launch_target_in_herdr, EnsureLaunchTar
 use crate::launch_target_open::open_or_start_launch_target;
 use crate::launch_target_processes::find_launch_target_processes;
 use crate::launch_target_stop::{stop_launch_target, stop_launch_target_and_close_herdr_tab};
-use crate::manifest_approval::ensure_launch_target_approved;
 use crate::runtime_metadata::load_launch_target_runtime_metadata;
 use crate::state_paths::worktree_state_directory;
 use crate::worktree_processes::inspect_worktree_processes;
@@ -34,9 +33,9 @@ pub fn run_portboard_cli(arguments: &[String]) -> Result<()> {
         "status" => run_status_command(&arguments[1..]),
         "ps" => run_ps_command(&arguments[1..]),
         "open" => run_open_command(&arguments[1..]),
-        "approve" => run_approve_command(&arguments[1..]),
         "ensure" => run_ensure_command(&arguments[1..]),
         "url" => run_url_command(&arguments[1..]),
+        "open-url" => run_open_url_command(&arguments[1..]),
         "logs" => run_logs_command(&arguments[1..]),
         "stop" => run_stop_command(&arguments[1..]),
         "serve" => run_serve_command(&arguments[1..]),
@@ -51,34 +50,6 @@ pub fn run_portboard_cli(arguments: &[String]) -> Result<()> {
         }
         other => bail!("Portboard command `{other}` is unknown; run `portboard help`"),
     }
-}
-
-fn run_approve_command(arguments: &[String]) -> Result<()> {
-    let mut target_id = None;
-    let mut cwd = None;
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--cwd" => {
-                index += 1;
-                cwd = Some(PathBuf::from(
-                    arguments
-                        .get(index)
-                        .context("Portboard approve --cwd needs a path")?,
-                ));
-            }
-            value if target_id.is_none() => target_id = Some(value),
-            other => bail!("Portboard approve argument `{other}` is unexpected"),
-        }
-        index += 1;
-    }
-    let target_id = target_id.context("Portboard approve needs a launch target id")?;
-    let root = resolve_cli_worktree(cwd.as_deref())?;
-    let config = load_worktree_launch_targets(&root)?;
-    let target = configured_launch_target(&config, target_id)?;
-    ensure_launch_target_approved(&root, &config, target)?;
-    println!("{target_id}: approved");
-    Ok(())
 }
 
 fn run_status_command(arguments: &[String]) -> Result<()> {
@@ -193,21 +164,34 @@ fn run_ps_command(arguments: &[String]) -> Result<()> {
             } else {
                 entry.target_ids.join(", ")
             },
+            ports: if entry.endpoints.is_empty() {
+                "—".to_string()
+            } else {
+                entry
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| format!(":{}", endpoint.port))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
             argv: entry.argv.join(" "),
         })
         .collect::<Vec<_>>();
     let pid_width = column_width("PID", rows.iter().map(|row| row.pid.as_str()));
     let target_width = column_width("TARGET", rows.iter().map(|row| row.target.as_str()));
+    let port_width = column_width("PORTS", rows.iter().map(|row| row.ports.as_str()));
     println!(
-        "{}  {}  ARGV",
+        "{}  {}  {}  ARGV",
         pad_column("PID", pid_width),
-        pad_column("TARGET", target_width)
+        pad_column("TARGET", target_width),
+        pad_column("PORTS", port_width)
     );
     for row in &rows {
         println!(
-            "{}  {}  {}",
+            "{}  {}  {}  {}",
             pad_column(&row.pid, pid_width),
             pad_column(&row.target, target_width),
+            pad_column(&row.ports, port_width),
             truncate_column(&row.argv, 60)
         );
     }
@@ -217,6 +201,7 @@ fn run_ps_command(arguments: &[String]) -> Result<()> {
 struct PsRow {
     pid: String,
     target: String,
+    ports: String,
     argv: String,
 }
 
@@ -364,6 +349,30 @@ fn run_url_command(arguments: &[String]) -> Result<()> {
         }
     } else {
         println!();
+    }
+    Ok(())
+}
+
+/// Opens a clicked loopback URL (from the Herdr link handler) in a browser.
+fn run_open_url_command(arguments: &[String]) -> Result<()> {
+    let url = arguments
+        .first()
+        .cloned()
+        .or_else(|| {
+            env::var_os("HERDR_PLUGIN_CLICKED_URL")
+                .map(|value| value.to_string_lossy().into_owned())
+        })
+        .context("Portboard open-url needs a URL argument or HERDR_PLUGIN_CLICKED_URL")?;
+    // The manifest pattern already restricts clicks to loopback http(s) URLs;
+    // revalidate here so this command is safe to invoke by hand too.
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        bail!("Portboard open-url only opens http and https URLs, got `{url}`");
+    }
+    match open_browser_url(&url) {
+        UrlOpenOutcome::OpenedLocally => println!("opened {url}"),
+        UrlOpenOutcome::OfferedLink => {
+            println!("{url} (no local browser; ctrl-click it in a pane)")
+        }
     }
     Ok(())
 }
@@ -697,6 +706,6 @@ fn resolve_cli_worktree(cwd: Option<&Path>) -> Result<PathBuf> {
 
 fn print_usage() {
     println!(
-        "Portboard\n\nUsage:\n  portboard status [--json] [--cwd PATH]\n  portboard ps [--json] [--cwd PATH]\n  portboard approve TARGET [--cwd PATH]\n  portboard open [TARGET] [--cwd PATH]\n  portboard ensure TARGET --herdr [--wait] [--cwd PATH]\n  portboard url TARGET [ENDPOINT] [--open] [--cwd PATH]\n  portboard logs TARGET [--lines N] [--follow] [--cwd PATH]\n  portboard stop TARGET [--cwd PATH]\n  portboard serve [--cwd PATH] [--bind ADDRESS]\n  portboard panel\n"
+        "Portboard\n\nUsage:\n  portboard status [--json] [--cwd PATH]\n  portboard ps [--json] [--cwd PATH]\n  portboard open [TARGET] [--cwd PATH]\n  portboard ensure TARGET --herdr [--wait] [--cwd PATH]\n  portboard url TARGET [ENDPOINT] [--open] [--cwd PATH]\n  portboard open-url [URL]\n  portboard logs TARGET [--lines N] [--follow] [--cwd PATH]\n  portboard stop TARGET [--cwd PATH]\n  portboard serve [--cwd PATH] [--bind ADDRESS]\n  portboard panel\n"
     );
 }

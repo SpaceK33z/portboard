@@ -9,12 +9,16 @@ Portboard works as a standalone command and local web dashboard. Its optional [H
 Portboard never asks you to choose a repository or worktree from its Herdr plugin. The Herdr action always receives the current workspace, resolves its Git worktree, and shows only that worktree's launch targets and runs.
 
 ```text
-Portboard >
-
-▸ Full dev stack    running :17640
-  Worker            stopped
-
-enter: open or start · ctrl-o: url · ctrl-s: stop · ctrl-r: refresh · esc: close
+┌ Portboard · /path/to/repo ────────────┐
+│ targets            │ Dev server       │
+│ ▸ dev-full running │ state running    │
+│   worker  stopped  │ argv pnpm dev    │
+│                    │ endpoints        │
+│                    │ ▸ web http://…   │
+├────────────────────┴──────────────────┤
+│ enter open/start · o open url · y copy │
+│ s stop · r refresh · tab endpoints · q │
+└───────────────────────────────────────┘
 ```
 
 Repository and worktree navigation remain Herdr's responsibility. Portboard answers a narrower question: what can I run or inspect here?
@@ -72,12 +76,6 @@ process_match = ["scripts/dev_worker.py"]
 
 Unknown manifest or runtime fields, duplicate IDs, blank values, unsafe relative paths, invalid URLs, and control characters in labels are rejected instead of being silently ignored.
 
-### Command approval
-
-A repository manifest is executable configuration. Before Portboard starts a target for the first time, it displays the exact cwd and JSON-quoted argument vector and asks for approval. `portboard approve TARGET` performs that review without starting the target, which is useful before non-interactive environment setup. Approval is recorded for the Git repository, exact manifest contents, and target, so identical manifests share approval across linked worktrees. Changing `portboard.toml` invalidates prior approvals.
-
-Approvals are stored in `$XDG_STATE_HOME/portboard/approvals.json`, or `~/.local/state/portboard/approvals.json` when `XDG_STATE_HOME` is unset. `PORTBOARD_STATE_DIR` overrides the state directory for isolated automation. A non-interactive invocation must opt in explicitly with `PORTBOARD_APPROVE=1`; otherwise it fails without running the command.
-
 Portboard uses an advisory per-worktree/target launch lock and records the launched root PID plus its Linux start time. Until the configured signature becomes visible or that exact launcher exits, another Portboard process reports the target as starting instead of launching a duplicate. This covers delayed startup across CLI processes and multiple dashboard servers without confusing a reused numeric PID for the original launcher.
 
 Duplicates are surfaced, never merged into a healthy state. When more than one live process matches a target's signature, text status reports `running · DUPLICATE (N instances)`, JSON status sets `"duplicate": true`, the popup shows `duplicate!`, and the dashboard highlights the row in red; `portboard open` refuses to focus or start anything and lists every matching PID with its argument vector. A process whose command line matches two launch targets is reported as a warning in status output, the popup header, and the dashboard API so overlapping `process_match` signatures get fixed in the manifest.
@@ -106,7 +104,7 @@ portboard ps
 portboard ps --json
 ```
 
-Each row shows the PID, the launch target that claims it (`—` when none), and the command line. This answers "what is running here" even in repositories without `portboard.toml`, including processes that never listen on a port. Add a manifest to manage those processes as launch targets; the Herdr popup shows the same inventory count when no manifest exists yet.
+Each row shows the PID, the launch target that claims it (`—` when none), every listening TCP port attributed to that process (`—` when it has none), and the command line. This answers "what is running here and what ports does it hold" even in repositories without `portboard.toml`, including processes that never listen on a port. Add a manifest to manage those processes as launch targets; the Herdr popup lists the same process inventory when no manifest exists yet.
 
 Ensure an agent-visible launch target without changing the current pane's focus:
 
@@ -152,7 +150,7 @@ portboard serve
 
 The default address is `http://127.0.0.1:9777`. Use `--bind 127.0.0.1:PORT` to select another loopback port and `--cwd PATH` to select a worktree. Non-loopback bind addresses are rejected.
 
-The dashboard polls `GET /api/status` and can approve, start, and stop targets. State-changing requests require the per-server `X-Portboard-Token` embedded in the dashboard page. Commands started by the dashboard are detached into their own process groups; stdout and stderr are written to timestamped per-worktree logs below the Portboard state directory. Each start creates a new `{target}.{timestamp}.log` file, a stable `{target}.log` symlink always points at the newest run, and older logs are pruned to the newest five so previous runs remain inspectable after a crash or restart. Stop sends `SIGTERM` to the complete dashboard-owned process group. For a manually started matching target, stop sends `SIGTERM` to each revalidated matching PID and escalates to `SIGKILL` after the grace period.
+The dashboard polls `GET /api/status` and can start and stop targets. State-changing requests require the per-server `X-Portboard-Token` embedded in the dashboard page. Commands started by the dashboard are detached into their own process groups; stdout and stderr are written to timestamped per-worktree logs below the Portboard state directory. Each start creates a new `{target}.{timestamp}.log` file, a stable `{target}.log` symlink always points at the newest run, and older logs are pruned to the newest five so previous runs remain inspectable after a crash or restart. Stop sends `SIGTERM` to the complete dashboard-owned process group. For a manually started matching target, stop sends `SIGTERM` to each revalidated matching PID and escalates to `SIGKILL` after the grace period.
 
 The dashboard supervisor and its in-memory child handles exist for the lifetime of `portboard serve`. Runs remain discoverable through `/proc` if the dashboard exits, but a restarted dashboard does not regain the original `Child` handle or log stream.
 
@@ -184,6 +182,8 @@ herdr server reload-config
 
 Press `prefix+p` in a workspace to open Portboard for that workspace only.
 
+The plugin also registers a link handler for loopback URLs: ctrl-clicking any `http://localhost`, `127.0.0.1`, or `[::1]` URL in any Herdr pane routes it to the `open-url` action, which opens it in a browser on a local desktop and defers to Herdr's client-side ctrl-click over SSH. No keybinding is needed for this; it comes from the plugin manifest.
+
 ### Open-or-start behavior
 
 Selecting a launch target performs the human-oriented `open` operation with context-sensitive behavior:
@@ -194,13 +194,20 @@ Selecting a launch target performs the human-oriented `open` operation with cont
 
 Runs started through the Herdr adapter survive laptop disconnects because the remote Herdr server owns their terminals. Coding agents use `ensure --herdr --wait`, which creates the same dedicated tab but deliberately leaves their working pane focused.
 
-### Opening the browser URL from the popup
+### The popup panel
 
-Pressing `ctrl-o` on a target shows its browser URL (primary named endpoint, first named endpoint, or first discovered listener) and opens it with `xdg-open` on a local desktop. The URL is printed as an OSC 8 hyperlink, and Herdr makes both hyperlinks and visible `http://` URLs ctrl-clickable in every pane.
+`portboard panel` renders a small terminal UI (ratatui) in the Herdr popup pane instead of an fzf picker, giving each target's endpoints untruncated room of their own:
 
-This also works through `herdr --remote`: the click is handled by the local Herdr client, so the URL opens in your local browser even though the run lives on the remote server. Keep in mind the URL still says `localhost`, so the port must be reachable locally (for example through an SSH tunnel) for the page to load.
+- The **left column** lists launch targets with status (`running` / `stopped` / `duplicate!`) and PIDs, above a **ports** list of every TCP listener discovered in the worktree — whether or not a manifest claims its process. Each port row shows its URL, owning PID, and claiming target when one exists.
+- The **right column** details the selected target — state, argument vector, and an **endpoints** list where every named or discovered URL is its own row.
+- **`enter`** opens or starts the selected target (the `open` behavior above) and closes the panel; on a port row it opens that URL.
+- **`o`** opens the selected endpoint or port URL (or the target's primary URL) with `xdg-open` on a local desktop; **`y`** copies it to the clipboard via OSC 52; **`s`** stops the selected target; **`r`** refreshes now (status also polls every two seconds); **`tab`** / **←** / **→** cycles focus between the targets, ports, and endpoints lists; **`q`** closes the panel and **`esc`** steps focus back one list first.
+- **Click** a target row to select it, or click an endpoint or port row to open that URL directly.
+- Endpoint URLs are shown as plain text, so Herdr's client-side ctrl-click opens them and terminal text selection can copy them. This still works through `herdr --remote`: the click is handled by the local Herdr client, so the URL opens in your local browser even though the run lives on the remote server. Keep in mind the URL still says `localhost`, so the port must be reachable locally (for example through an SSH tunnel) for the page to load.
 
-The popup is backed by the same current-worktree configuration, process discovery, endpoint discovery, approval, duplicate-prevention, and stop code as the standalone interfaces. It does not add a worktree picker or global process browser.
+Without a `portboard.toml`, the panel lists the live process inventory in the worktree instead of launch targets, with each process's listening ports inline. The worktree-wide ports list is always visible either way: Portboard shows every listener it can attribute to a worktree process even when nothing is declared in a manifest.
+
+The popup is backed by the same current-worktree configuration, process discovery, endpoint discovery, duplicate-prevention, and stop code as the standalone interfaces. It does not add a worktree picker or global process browser.
 
 ## Process and endpoint discovery
 
@@ -213,6 +220,12 @@ Portboard's current Linux discovery path is deliberately small and deterministic
 5. Walk matching process descendants, map their socket file descriptors to `/proc/net/tcp` and `/proc/net/tcp6`, and report listening TCP addresses.
 6. For `ensure --wait`, request the primary HTTP endpoint until it returns a 2xx or 3xx response.
 
+The same discovery powers the worktree-wide ports view: every inventoried worktree process gets one grouped `/proc/net/tcp` scan that attributes each listening socket to the process whose tree owns it, so undeclared dev servers show up next to configured ones.
+
+### Clicked localhost links
+
+The Herdr plugin registers a link handler for loopback URLs (`localhost`, `127.0.0.1`, `[::1]`). Ctrl-clicking any such URL in any Herdr pane invokes `portboard open-url`, which opens it with `xdg-open` on a local desktop and defers to Herdr's client-side ctrl-click over SSH. The command revalidates that the URL is http(s) before opening, so it is safe to invoke by hand as well.
+
 A process that exits during inspection is discarded. Generic endpoint discovery is limited to the current Linux network namespace and TCP listeners visible through procfs. Portboard does not currently inspect Docker/Compose metadata, manage Tailscale Serve, or expose raw TCP services.
 
 ## Architecture
@@ -223,7 +236,7 @@ The implemented adapters share one Rust core:
 Portboard core
 ├── current-worktree resolution
 ├── strict launch-target configuration
-├── manifest approval and launch locking
+├── launch locking
 ├── /proc process revalidation
 ├── named runtime metadata and HTTP readiness
 ├── descendant TCP listener discovery
@@ -236,7 +249,7 @@ Run hosts
 
 Presentations
 ├── command line and JSON status
-├── fzf current-workspace popup
+├── terminal UI popup (ratatui)
 └── loopback web dashboard and JSON API
 ```
 
@@ -245,7 +258,6 @@ Presentations
 - Linux with procfs
 - Git
 - Rust 1.87 or newer when building from source
-- `fzf` 0.71 or newer for the Herdr popup
 - Optional: Herdr 0.7.4 or newer
 
 ## Alternatives

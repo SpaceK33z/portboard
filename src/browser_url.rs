@@ -34,6 +34,25 @@ pub fn browser_url(status: &CurrentLaunchTargetStatus) -> Option<String> {
         .map(|endpoint| format!("http://{}:{}", endpoint.address, endpoint.port))
 }
 
+/// Copies a URL to the terminal clipboard with OSC 52 (base64-encoded).
+///
+/// Returns false when the sequence cannot be written so the caller can tell
+/// the user to select the visible URL text instead. OSC 52 needs no helper
+/// binary and works across SSH because the terminal that owns the pane does
+/// the copy, so it is the right choice for a panel that can run remotely.
+pub fn copy_url_to_clipboard(url: &str) -> bool {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    let encoded = STANDARD.encode(url.as_bytes());
+    let sequence = format!("\x1b]52;c;{encoded}\x07");
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(sequence.as_bytes()).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
+}
+
 /// Wraps a URL in an OSC 8 terminal hyperlink.
 ///
 /// Herdr ctrl-click opens both OSC 8 hyperlinks and visible http(s) URLs, and

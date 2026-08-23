@@ -4,7 +4,10 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::launch_target_config::LaunchTarget;
-use crate::launch_target_processes::{find_launch_target_processes, find_worktree_processes};
+use crate::launch_target_processes::{
+    find_launch_target_processes, find_worktree_processes, LaunchTargetProcess,
+};
+use crate::process_endpoints::{find_process_endpoints_by_process, ProcessEndpoint};
 
 /// One running worktree process together with the launch targets that claim it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -14,6 +17,8 @@ pub struct WorktreeProcessInventoryEntry {
     /// Ids of configured launch targets whose signature matches this process.
     /// Empty when no manifest claims the process or no manifest exists.
     pub target_ids: Vec<String>,
+    /// Listening TCP endpoints owned by this process or its descendants.
+    pub endpoints: Vec<ProcessEndpoint>,
 }
 
 /// Inventories every live process in the worktree and attributes configured
@@ -35,10 +40,25 @@ pub fn inspect_worktree_processes(
             }
         }
     }
+    // One grouped scan attributes every listener in the worktree to its owning
+    // process so the inventory can show ports with or without a manifest.
+    let endpoint_groups = find_process_endpoints_by_process(
+        &processes
+            .iter()
+            .map(|process| LaunchTargetProcess {
+                pid: process.pid,
+                argv: Vec::new(),
+            })
+            .collect::<Vec<_>>(),
+    )?;
     Ok(processes
         .into_iter()
         .zip(claims)
         .map(|(process, target_ids)| WorktreeProcessInventoryEntry {
+            endpoints: endpoint_groups
+                .get(&process.pid)
+                .cloned()
+                .unwrap_or_default(),
             pid: process.pid,
             argv: process.argv,
             target_ids,
