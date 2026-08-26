@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -10,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::launch_target_config::LaunchTarget;
-use crate::launch_target_processes::LaunchTargetProcess;
+use crate::launch_target_processes::{process_has_portboard_target_identity, LaunchTargetProcess};
 
 /// Current workspace data injected when a Herdr plugin action is invoked.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -89,8 +90,16 @@ pub fn launch_target_in_herdr(
     let tab_id = response.result.tab.tab_id;
     let pane_id = response.result.root_pane.pane_id;
 
+    // `herdr pane run` joins its arguments with spaces and lets the pane's
+    // shell re-parse the line, so every argument needs shell quoting to
+    // survive; otherwise spaces and metacharacters split or reinterpret.
     let mut run_arguments = vec!["pane", "run", pane_id.as_str()];
-    run_arguments.extend(target.argv.iter().map(String::as_str));
+    let quoted_argv: Vec<String> = target
+        .argv
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect();
+    run_arguments.extend(quoted_argv.iter().map(String::as_str));
     if let Err(error) = run_herdr_command(&run_arguments) {
         let _ = run_herdr_command(&["tab", "close", &tab_id]);
         return Err(error).context("Portboard Herdr launch could not start the target command");
@@ -107,6 +116,23 @@ pub fn launch_target_in_herdr(
         run_herdr_command(&["tab", "focus", &tab_id])?;
     }
     Ok(launcher_pid)
+}
+
+/// Quotes one argument as a POSIX shell word. Single quotes preserve every
+/// character except the single quote itself, which closes the word, escapes
+/// via `\'`, and reopens.
+fn shell_quote(argument: &str) -> String {
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('\'');
+    for character in argument.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Resolves the pid of the command started via `herdr pane run`. Right after
@@ -188,6 +214,93 @@ pub fn launch_target_herdr_tab_id(
         return Ok(Some(pane.tab_id));
     }
     Ok(None)
+}
+
+/// Closes leftover Herdr tabs that a launch target left behind after dying on
+/// its own (crash, Ctrl+C in the pane, external kill). A tab is stale when its
+/// label matches the target id and every pane in it is a Portboard-owned host
+/// shell with no foreground command; busy or foreign panes are never touched.
+/// Returns the closed tab ids.
+pub fn reap_stale_launch_target_tabs(
+    workspace_id: &str,
+    target: &LaunchTarget,
+) -> Result<Vec<String>> {
+    let tabs: HerdrResponse<HerdrTabListResult> =
+        run_herdr_json(&["tab", "list", "--workspace", workspace_id])?;
+    let panes: HerdrResponse<HerdrPaneListResult> =
+        run_herdr_json(&["pane", "list", "--workspace", workspace_id])?;
+    let mut pane_ids_by_tab: HashMap<String, Vec<String>> = HashMap::new();
+    for pane in panes.result.panes {
+        pane_ids_by_tab
+            .entry(pane.tab_id)
+            .or_default()
+            .push(pane.pane_id);
+    }
+
+    let mut closed_tabs = Vec::new();
+    for tab in &tabs.result.tabs {
+        if tab.label != target.id.as_str() {
+            continue;
+        }
+        let Some(pane_ids) = pane_ids_by_tab.get(&tab.tab_id) else {
+            continue;
+        };
+        let liveness = pane_ids
+            .iter()
+            .map(|pane_id| pane_liveness(pane_id, target.id.as_str()))
+            .collect::<Vec<_>>();
+        if !tab_is_reapable(&liveness) {
+            continue;
+        }
+        run_herdr_command(&["tab", "close", &tab.tab_id])?;
+        closed_tabs.push(tab.tab_id.clone());
+    }
+    Ok(closed_tabs)
+}
+
+struct LaunchTargetPaneLiveness {
+    portboard_owned: bool,
+    has_foreground_command: bool,
+}
+
+fn pane_liveness(pane_id: &str, target_id: &str) -> LaunchTargetPaneLiveness {
+    let default = LaunchTargetPaneLiveness {
+        portboard_owned: false,
+        has_foreground_command: true,
+    };
+    let Ok(response) = run_herdr_json::<HerdrResponse<HerdrPaneProcessResult>>(&[
+        "pane",
+        "process-info",
+        "--pane",
+        pane_id,
+    ]) else {
+        return default;
+    };
+    let process_info = response.result.process_info;
+    let portboard_owned = process_has_portboard_target_identity(
+        &crate::launch_target_processes::LaunchTargetProcess {
+            pid: process_info.shell_pid,
+            argv: Vec::new(),
+        },
+        target_id,
+    );
+    LaunchTargetPaneLiveness {
+        portboard_owned,
+        has_foreground_command: process_info
+            .foreground_processes
+            .iter()
+            .any(|process| process.pid != process_info.shell_pid),
+    }
+}
+
+/// Decides whether a candidate tab may be reaped. Every pane must be an idle
+/// Portboard-owned host shell, so user work in splits is never discarded and a
+/// live run keeps its tab.
+fn tab_is_reapable(panes: &[LaunchTargetPaneLiveness]) -> bool {
+    !panes.is_empty()
+        && panes
+            .iter()
+            .all(|pane| pane.portboard_owned && !pane.has_foreground_command)
 }
 
 /// Closes a Herdr tab after its Portboard-owned target has stopped.
@@ -286,6 +399,18 @@ struct HerdrPaneIdentity {
 }
 
 #[derive(Deserialize)]
+struct HerdrTabListResult {
+    #[serde(default)]
+    tabs: Vec<HerdrTabRecord>,
+}
+
+#[derive(Deserialize)]
+struct HerdrTabRecord {
+    tab_id: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
 struct HerdrPaneListResult {
     panes: Vec<HerdrPaneRecord>,
 }
@@ -315,7 +440,54 @@ struct HerdrForegroundProcess {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_herdr_plugin_context;
+    use super::{
+        parse_herdr_plugin_context, shell_quote, tab_is_reapable, HerdrTabRecord,
+        LaunchTargetPaneLiveness,
+    };
+
+    fn pane(portboard_owned: bool, has_foreground_command: bool) -> LaunchTargetPaneLiveness {
+        LaunchTargetPaneLiveness {
+            portboard_owned,
+            has_foreground_command,
+        }
+    }
+
+    #[test]
+    fn reaps_a_tab_whose_host_shells_are_all_idle_and_owned() {
+        assert!(tab_is_reapable(&[pane(true, false)]));
+        assert!(tab_is_reapable(&[pane(true, false), pane(true, false)]));
+    }
+
+    #[test]
+    fn keeps_tabs_with_busy_or_foreign_panes() {
+        // The server is still running in one of the panes.
+        assert!(!tab_is_reapable(&[pane(true, true)]));
+        // A foreign shell (user split, no Portboard marker) blocks reaping.
+        assert!(!tab_is_reapable(&[pane(true, false), pane(false, false)]));
+        // Nothing Portboard-owned means the tab is not ours to close.
+        assert!(!tab_is_reapable(&[pane(false, false)]));
+        assert!(!tab_is_reapable(&[]));
+    }
+
+    #[test]
+    fn tab_records_need_label_and_id_only() {
+        let record: HerdrTabRecord =
+            serde_json::from_str(r#"{"tab_id":"w2:t31","label":"dev","number":97,"pane_count":1}"#)
+                .expect("tab record");
+        assert_eq!(record.tab_id, "w2:t31");
+        assert_eq!(record.label, "dev");
+    }
+
+    #[test]
+    fn shell_quotes_arguments_for_pane_run() {
+        assert_eq!(shell_quote("sleep"), "'sleep'");
+        assert_eq!(
+            shell_quote("exec -a renamed sleep 300"),
+            "'exec -a renamed sleep 300'"
+        );
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("$HOME `x` ;"), "'$HOME `x` ;'");
+    }
 
     #[test]
     fn parses_workspace_identity_from_plugin_action_context() {

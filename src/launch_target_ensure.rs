@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::herdr_workspace::{
     current_herdr_workspace_id, launch_target_in_herdr, launch_target_runs_in_herdr,
+    reap_stale_launch_target_tabs,
 };
 use crate::launch_target_config::{LaunchTarget, PortboardConfig};
 use crate::launch_target_lock::LaunchTargetLock;
@@ -45,6 +46,14 @@ pub fn ensure_launch_target_in_herdr(
     )?;
     let target = find_launch_target(config, target_id)?;
     let mut launch_lock = LaunchTargetLock::acquire(worktree_root, target)?;
+    if let Some(workspace_id) = current_herdr_workspace_id() {
+        // Leftover tabs from a crashed run must go before any new tab is
+        // created. Holding the launch lock prevents racing a concurrent start;
+        // failures are non-fatal for the ensure flow.
+        if let Err(error) = reap_stale_launch_target_tabs(&workspace_id, target) {
+            eprintln!("Portboard could not reap stale tabs: {error:#}");
+        }
+    }
     let processes = find_launch_target_processes(worktree_root, target)?;
     if !processes.is_empty() {
         launch_lock.clear()?;

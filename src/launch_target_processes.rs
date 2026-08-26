@@ -21,7 +21,12 @@ pub struct WorktreeProcess {
     pub argv: Vec<String>,
 }
 
-/// Finds live Linux processes whose cwd and argv match a worktree launch target.
+/// Finds live Linux processes belonging to a worktree launch target. A process
+/// matches when its cwd and argv match the configured pattern, or when it
+/// inherited the target's `PORTBOARD_TARGET_ID` identity from a Portboard-run
+/// host pane. The identity pass keeps detection working across re-exec and
+/// wrapper scripts that would otherwise hide the real server from argv
+/// matching; interactive host shells carrying the marker are ignored.
 pub fn find_launch_target_processes(
     worktree_root: &Path,
     target: &LaunchTarget,
@@ -33,12 +38,21 @@ pub fn find_launch_target_processes(
     };
     let mut matches = Vec::new();
     for process in find_worktree_processes(worktree_root)? {
-        if process_match.iter().all(|expected| {
+        let argv_matches = process_match.iter().all(|expected| {
             process
                 .argv
                 .iter()
                 .any(|argument| process_argument_matches(argument, expected))
-        }) {
+        });
+        let identity_matches = !looks_like_interactive_shell(&process.argv)
+            && process_has_portboard_target_identity(
+                &LaunchTargetProcess {
+                    pid: process.pid,
+                    argv: process.argv.clone(),
+                },
+                target.id.as_str(),
+            );
+        if argv_matches || identity_matches {
             matches.push(LaunchTargetProcess {
                 pid: process.pid,
                 argv: process.argv,
@@ -46,6 +60,30 @@ pub fn find_launch_target_processes(
         }
     }
     Ok(matches)
+}
+
+/// Shell basenames whose bare invocation identifies an interactive shell.
+const INTERACTIVE_SHELL_NAMES: &[&str] = &[
+    "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "nu", "elvish", "xonsh",
+];
+
+/// Returns whether a command line looks like a bare interactive shell.
+///
+/// Portboard's Herdr host panes carry `PORTBOARD_TARGET_ID` in their shell
+/// environment, so every pane shell inherits the target identity. Those shells
+/// outlive the target command and must never count as a live run; wrappers
+/// such as `bash -c ...` keep their arguments and stay detectable.
+fn looks_like_interactive_shell(argv: &[String]) -> bool {
+    let Some(first) = argv.first() else {
+        return false;
+    };
+    let name = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    // Login shells render with a leading dash, for example `-bash`.
+    let name = name.strip_prefix('-').unwrap_or(name);
+    INTERACTIVE_SHELL_NAMES.contains(&name) && argv.len() <= 1
 }
 
 /// Scans `/proc` for every live process whose cwd is inside the canonical
@@ -173,7 +211,8 @@ mod tests {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    use super::{find_launch_target_processes, process_has_portboard_target_identity};
+    use super::process_has_portboard_target_identity;
+    use super::{find_launch_target_processes, looks_like_interactive_shell};
 
     /// Creates the directory so the git fixtures below have a stable parent.
     fn fs_err_create(path: &Path) {
@@ -209,6 +248,56 @@ process_match = ["{executable_name}"]
         assert!(!processes
             .iter()
             .any(|process| process.pid == std::process::id()));
+    }
+
+    #[test]
+    fn detects_a_reexeced_process_through_inherited_identity() {
+        let temporary = tempfile::tempdir().expect("temporary worktree");
+        let config = parse_launch_target_config(
+            r#"
+version = 1
+
+[[launch_targets]]
+id = "identity-server"
+label = "Identity server"
+argv = ["never-matches-anything"]
+process_match = ["never-matches-anything"]
+"#,
+        )
+        .expect("launch target config");
+        let mut child = Command::new("sleep")
+            .args(["30"])
+            .env("PORTBOARD_TARGET_ID", "identity-server")
+            .current_dir(temporary.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("identity test process");
+
+        let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
+            .expect("process scan");
+        child.kill().expect("kill identity test process");
+
+        assert!(processes.iter().any(|process| process.pid == child.id()));
+    }
+
+    #[test]
+    fn ignores_interactive_host_shells_carrying_the_identity() {
+        // A bare shell inherits PORTBOARD_TARGET_ID from the host pane but is
+        // never a live run, while `sh -c ...` wrappers stay detectable.
+        assert!(looks_like_interactive_shell(&["bash".to_string()]));
+        assert!(looks_like_interactive_shell(&["-bash".to_string()]));
+        assert!(looks_like_interactive_shell(&["/usr/bin/zsh".to_string()]));
+        assert!(!looks_like_interactive_shell(&[
+            "bash".to_string(),
+            "-c".to_string(),
+            "exec server".to_string()
+        ]));
+        assert!(!looks_like_interactive_shell(&[
+            "node".to_string(),
+            "server.js".to_string()
+        ]));
+        assert!(!looks_like_interactive_shell(&[]));
     }
 
     #[test]

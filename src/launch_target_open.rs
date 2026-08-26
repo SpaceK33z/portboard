@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::herdr_workspace::{
     current_herdr_workspace_id, focus_launch_target_in_herdr, launch_target_in_herdr,
+    reap_stale_launch_target_tabs,
 };
 use crate::launch_target_config::{LaunchTarget, PortboardConfig};
 use crate::launch_target_lock::LaunchTargetLock;
@@ -18,6 +19,9 @@ pub fn open_or_start_launch_target(
 ) -> Result<()> {
     let target = select_launch_target(config, requested_target_id)?;
     let mut launch_lock = LaunchTargetLock::acquire(worktree_root, target)?;
+    if let Some(workspace_id) = current_herdr_workspace_id() {
+        report_reaped_tabs(&workspace_id, target);
+    }
     let processes = find_launch_target_processes(worktree_root, target)?;
     if !processes.is_empty() {
         launch_lock.clear()?;
@@ -77,6 +81,22 @@ pub fn open_or_start_launch_target(
     // processes; the advisory lock need not cover the complete run lifetime.
     drop(launch_lock);
     wait_for_attached_launch(child, target)
+}
+
+/// Best-effort cleanup of leftover tabs; failures never block opening.
+fn report_reaped_tabs(workspace_id: &str, target: &LaunchTarget) {
+    match reap_stale_launch_target_tabs(workspace_id, target) {
+        Ok(closed) if !closed.is_empty() => {
+            println!(
+                "Closed {} stale {} tab{}",
+                closed.len(),
+                target.label,
+                if closed.len() == 1 { "" } else { "s" }
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("Portboard could not reap stale tabs: {error:#}"),
+    }
 }
 
 fn select_launch_target<'a>(

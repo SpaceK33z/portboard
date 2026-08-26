@@ -614,7 +614,10 @@ impl PanelApp {
             .block(
                 Block::new()
                     .borders(Borders::ALL)
-                    .title(Span::styled(" targets ", self.pane_title_style(Focus::Targets)))
+                    .title(Span::styled(
+                        " targets ",
+                        self.pane_title_style(Focus::Targets),
+                    ))
                     .border_style(self.pane_border_style(Focus::Targets)),
             )
             .highlight_style(self.pane_highlight_style(Focus::Targets))
@@ -631,7 +634,10 @@ impl PanelApp {
             .block(
                 Block::new()
                     .borders(Borders::ALL)
-                    .title(Span::styled(ports_title, self.pane_title_style(Focus::Ports)))
+                    .title(Span::styled(
+                        ports_title,
+                        self.pane_title_style(Focus::Ports),
+                    ))
                     .border_style(self.pane_border_style(Focus::Ports)),
             )
             .highlight_style(self.pane_highlight_style(Focus::Ports))
