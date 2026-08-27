@@ -36,30 +36,53 @@ pub fn find_launch_target_processes(
     } else {
         &target.process_match
     };
-    let mut matches = Vec::new();
-    for process in find_worktree_processes(worktree_root)? {
-        let argv_matches = process_match.iter().all(|expected| {
-            process
-                .argv
-                .iter()
-                .any(|argument| process_argument_matches(argument, expected))
-        });
-        let identity_matches = !looks_like_interactive_shell(&process.argv)
-            && process_has_portboard_target_identity(
-                &LaunchTargetProcess {
-                    pid: process.pid,
-                    argv: process.argv.clone(),
-                },
-                target.id.as_str(),
-            );
-        if argv_matches || identity_matches {
-            matches.push(LaunchTargetProcess {
-                pid: process.pid,
-                argv: process.argv,
-            });
-        }
+    let processes = find_worktree_processes(worktree_root)?;
+    let argv_matches = processes
+        .iter()
+        .filter(|process| {
+            process_match.iter().all(|expected| {
+                process
+                    .argv
+                    .iter()
+                    .any(|argument| process_argument_matches(argument, expected))
+            })
+        })
+        .map(as_launch_target_process)
+        .collect::<Vec<_>>();
+
+    // The configured signature is the authoritative instance boundary. Every
+    // descendant of a Portboard-hosted command inherits PORTBOARD_TARGET_ID,
+    // so mixing identity matches into a successful signature scan would count
+    // one process tree as many duplicate instances.
+    if !argv_matches.is_empty() {
+        return Ok(argv_matches);
     }
-    Ok(matches)
+
+    // Identity is only a fallback for a target whose coordinator re-execed and
+    // no longer exposes its configured argv. Keep only the top-most matching
+    // process in each identity-bearing tree so descendants remain one run.
+    let identity_matches = processes
+        .iter()
+        .filter(|process| {
+            !looks_like_interactive_shell(&process.argv)
+                && process_has_portboard_target_identity(
+                    &as_launch_target_process(process),
+                    target.id.as_str(),
+                )
+        })
+        .collect::<Vec<_>>();
+    let identity_pids = identity_matches
+        .iter()
+        .map(|process| process.pid)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(identity_matches
+        .into_iter()
+        .filter(|process| {
+            read_process_parent_pid(&PathBuf::from(format!("/proc/{}", process.pid)))
+                .is_none_or(|parent_pid| !identity_pids.contains(&parent_pid))
+        })
+        .map(as_launch_target_process)
+        .collect())
 }
 
 /// Shell basenames whose bare invocation identifies an interactive shell.
@@ -122,6 +145,12 @@ pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProce
         let Ok(cwd) = fs::read_link(process_path.join("cwd")) else {
             continue;
         };
+        // Linux appends " (deleted)" to /proc/<pid>/cwd after a worktree is
+        // removed. Such stale processes are not members of the parent checkout
+        // merely because their former path was nested below it.
+        if !cwd.exists() {
+            continue;
+        }
         if !cwd.starts_with(&canonical_root)
             || other_worktrees
                 .iter()
@@ -188,8 +217,25 @@ fn sibling_git_worktrees(canonical_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn as_launch_target_process(process: &WorktreeProcess) -> LaunchTargetProcess {
+    LaunchTargetProcess {
+        pid: process.pid,
+        argv: process.argv.clone(),
+    }
+}
+
 fn process_argument_matches(argument: &str, expected: &str) -> bool {
     argument == expected || Path::new(argument).ends_with(Path::new(expected))
+}
+
+fn read_process_parent_pid(process_path: &Path) -> Option<u32> {
+    let stat = fs::read_to_string(process_path.join("stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn read_process_start_time(process_path: &Path) -> Option<u64> {
@@ -248,6 +294,77 @@ process_match = ["{executable_name}"]
         assert!(!processes
             .iter()
             .any(|process| process.pid == std::process::id()));
+    }
+
+    #[test]
+    fn uses_the_signature_as_the_instance_boundary_for_a_process_tree() {
+        let temporary = tempfile::tempdir().expect("temporary worktree");
+        let script = temporary.path().join("instance-marker.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 30 &\nwait\n").expect("target script");
+        let config = parse_launch_target_config(
+            r#"
+version = 1
+
+[[launch_targets]]
+id = "tree-server"
+label = "Tree server"
+argv = ["sh", "instance-marker.sh"]
+process_match = ["instance-marker.sh"]
+"#,
+        )
+        .expect("launch target config");
+        let mut child = Command::new("sh")
+            .arg("instance-marker.sh")
+            .env("PORTBOARD_TARGET_ID", "tree-server")
+            .current_dir(temporary.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("process tree");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
+            .expect("process scan");
+
+        child.kill().expect("stop process tree");
+        child.wait().expect("reap process tree");
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, child.id());
+    }
+
+    #[test]
+    fn ignores_processes_in_a_deleted_nested_directory() {
+        let temporary = tempfile::tempdir().expect("temporary worktree");
+        let deleted = temporary.path().join("deleted-worktree");
+        fs::create_dir(&deleted).expect("nested directory");
+        let config = parse_launch_target_config(
+            r#"
+version = 1
+
+[[launch_targets]]
+id = "deleted-server"
+label = "Deleted server"
+argv = ["sleep", "30"]
+process_match = ["sleep", "30"]
+"#,
+        )
+        .expect("launch target config");
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("PORTBOARD_TARGET_ID", "deleted-server")
+            .current_dir(&deleted)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("deleted-directory process");
+        fs::remove_dir(&deleted).expect("remove nested directory");
+
+        let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
+            .expect("process scan");
+
+        child.kill().expect("stop deleted-directory process");
+        child.wait().expect("reap deleted-directory process");
+        assert!(processes.is_empty());
     }
 
     #[test]
