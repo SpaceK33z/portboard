@@ -67,10 +67,13 @@ process_match = ["scripts/dev_worker.py"]
   "startedAt": "2026-08-21T12:37:22.695Z",
   "endpoints": [
     { "id": "web", "url": "http://localhost:14715", "primary": true },
-    { "id": "api", "url": "http://localhost:11100", "primary": false }
+    { "id": "api", "url": "http://localhost:11100", "primary": false },
+    { "id": "model", "url": "http://127.0.0.1:8200", "primary": false, "status": "starting" }
   ]
 }
 ```
+
+An endpoint may carry an optional project-owned `status` string (for example the `starting`, `running`, or `failed` lifecycle of an optional supervised server). Portboard accepts and round-trips it in JSON output without interpreting it.
 
 `log_file` is an optional project-owned log path relative to the worktree. `portboard logs` reads that file directly, so it works for Herdr-hosted runs and survives Portboard process restarts.
 

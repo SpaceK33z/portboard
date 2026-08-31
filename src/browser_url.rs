@@ -193,6 +193,7 @@ process_match = ["portboard-browser-url-test"]
             id: id.to_string(),
             url: url.to_string(),
             primary,
+            status: None,
         }
     }
 }

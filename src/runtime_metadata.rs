@@ -17,6 +17,11 @@ pub struct RuntimeEndpoint {
     pub url: String,
     #[serde(default)]
     pub primary: bool,
+    /// Optional project-owned lifecycle for a supervised endpoint, such as the
+    /// `starting`, `running`, or `failed` state of an optional model server.
+    /// Portboard carries it through JSON output but does not interpret it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Versioned runtime metadata published by a project-owned process supervisor.
@@ -135,6 +140,15 @@ fn validate_runtime_metadata(
                 path.display()
             );
         }
+        if let Some(status) = &endpoint.status {
+            if status.trim().is_empty() {
+                bail!(
+                    "Portboard runtime endpoint `{}` at {} has an empty status",
+                    endpoint.id,
+                    path.display()
+                );
+            }
+        }
         primary_count += usize::from(endpoint.primary);
     }
     if primary_count > 1 {
@@ -246,5 +260,106 @@ runtime_file = "runtime.json"
         .expect("runtime metadata");
 
         assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn accepts_optional_endpoint_status() {
+        let worktree = tempfile::tempdir().expect("temporary worktree");
+        fs::create_dir(worktree.path().join("logs")).expect("logs directory");
+        fs::write(
+            worktree.path().join("logs/dev-instance.json"),
+            format!(
+                r#"{{
+  "version": 1,
+  "targetId": "dev-full",
+  "pid": {},
+  "startedAt": "2026-08-21T12:37:22.695Z",
+  "endpoints": [
+    {{"id": "web", "url": "http://localhost:3001", "primary": true}},
+    {{"id": "model", "url": "http://127.0.0.1:8200", "primary": false, "status": "running"}}
+  ]
+}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("runtime metadata");
+        let config = parse_launch_target_config(
+            r#"
+version = 1
+[[launch_targets]]
+id = "dev-full"
+label = "Full dev stack"
+argv = ["pnpm", "dev:full"]
+process_match = ["scripts/dev-full.mjs"]
+runtime_file = "logs/dev-instance.json"
+"#,
+        )
+        .expect("manifest");
+        let processes = vec![LaunchTargetProcess {
+            pid: std::process::id(),
+            argv: Vec::new(),
+        }];
+
+        let metadata = load_launch_target_runtime_metadata(
+            worktree.path(),
+            &config.launch_targets[0],
+            &processes,
+        )
+        .expect("runtime metadata")
+        .expect("matching metadata");
+
+        let model = metadata
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == "model")
+            .expect("model endpoint");
+        assert_eq!(model.status.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn rejects_empty_endpoint_status() {
+        let worktree = tempfile::tempdir().expect("temporary worktree");
+        fs::create_dir(worktree.path().join("logs")).expect("logs directory");
+        fs::write(
+            worktree.path().join("logs/dev-instance.json"),
+            format!(
+                r#"{{
+  "version": 1,
+  "targetId": "dev-full",
+  "pid": {},
+  "startedAt": "2026-08-21T12:37:22.695Z",
+  "endpoints": [
+    {{"id": "model", "url": "http://127.0.0.1:8200", "primary": false, "status": "  "}}
+  ]
+}}"#,
+                std::process::id()
+            ),
+        )
+        .expect("runtime metadata");
+        let config = parse_launch_target_config(
+            r#"
+version = 1
+[[launch_targets]]
+id = "dev-full"
+label = "Full dev stack"
+argv = ["pnpm", "dev:full"]
+process_match = ["scripts/dev-full.mjs"]
+runtime_file = "logs/dev-instance.json"
+"#,
+        )
+        .expect("manifest");
+        let processes = vec![LaunchTargetProcess {
+            pid: std::process::id(),
+            argv: Vec::new(),
+        }];
+
+        let error = load_launch_target_runtime_metadata(
+            worktree.path(),
+            &config.launch_targets[0],
+            &processes,
+        )
+        .expect_err("runtime metadata should be rejected");
+
+        assert!(format!("{error:#}").contains("empty status"));
     }
 }
