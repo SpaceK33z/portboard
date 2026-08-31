@@ -93,7 +93,12 @@ pub fn launch_target_in_herdr(
     // `herdr pane run` joins its arguments with spaces and lets the pane's
     // shell re-parse the line, so every argument needs shell quoting to
     // survive; otherwise spaces and metacharacters split or reinterpret.
-    let mut run_arguments = vec!["pane", "run", pane_id.as_str()];
+    // The target identity is prefixed as a POSIX inline assignment so the
+    // launched process tree carries PORTBOARD_TARGET_ID even when the host
+    // pane's shell did not inherit it from `tab create --env`; repository
+    // guards such as ethoinsights' require-portboard-dev-full.mjs depend on
+    // that variable to authorize a run inside Herdr.
+    let mut run_arguments = vec!["pane", "run", pane_id.as_str(), run_identity.as_str()];
     let quoted_argv: Vec<String> = target
         .argv
         .iter()

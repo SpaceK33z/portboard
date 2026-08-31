@@ -101,7 +101,14 @@ esac
     );
     let commands = fs::read_to_string(log).expect("Herdr commands");
     assert!(commands.contains("tab create --workspace w1"), "{commands}");
-    assert!(commands.contains("pane run w1:p2 'sleep' '30'"), "{commands}");
+    assert!(
+        commands.contains("--env PORTBOARD_TARGET_ID=probe"),
+        "{commands}"
+    );
+    assert!(
+        commands.contains("pane run w1:p2 PORTBOARD_TARGET_ID=probe 'sleep' '30'"),
+        "{commands}"
+    );
     assert!(!commands.contains("tab focus w1:t2"), "{commands}");
 }
 
@@ -461,7 +468,12 @@ esac
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stderr.contains("could not identify the target process"));
     let commands = fs::read_to_string(log).expect("Herdr commands");
-    assert_eq!(commands.matches("pane run w1:p2 'sleep' '30'").count(), 1);
+    assert_eq!(
+        commands
+            .matches("pane run w1:p2 PORTBOARD_TARGET_ID=probe 'sleep' '30'")
+            .count(),
+        1
+    );
     assert!(commands.contains("tab close w1:t2"));
     assert!(!commands.contains("tab focus w1:t2"));
 }
