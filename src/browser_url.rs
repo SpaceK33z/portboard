@@ -31,7 +31,7 @@ pub fn browser_url(status: &CurrentLaunchTargetStatus) -> Option<String> {
     status
         .endpoints
         .first()
-        .map(|endpoint| format!("http://{}:{}", endpoint.address, endpoint.port))
+        .map(|endpoint| listener_browser_url(&endpoint.address, endpoint.port))
 }
 
 /// Copies a URL to the terminal clipboard with OSC 52 (base64-encoded).
@@ -41,6 +41,9 @@ pub fn browser_url(status: &CurrentLaunchTargetStatus) -> Option<String> {
 /// binary and works across SSH because the terminal that owns the pane does
 /// the copy, so it is the right choice for a panel that can run remotely.
 pub fn copy_url_to_clipboard(url: &str) -> bool {
+    if validate_browser_url(url).is_err() {
+        return false;
+    }
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     let encoded = STANDARD.encode(url.as_bytes());
@@ -59,6 +62,9 @@ pub fn copy_url_to_clipboard(url: &str) -> bool {
 /// that click is handled by the local client, so the link keeps working when
 /// the pane lives on a remote server behind `herdr --remote`.
 pub fn osc8_hyperlink(url: &str) -> String {
+    if validate_browser_url(url).is_err() {
+        return "[invalid URL]".to_string();
+    }
     format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
 }
 
@@ -68,6 +74,9 @@ pub fn osc8_hyperlink(url: &str) -> String {
 /// `herdr --remote`) never spawn a server-side browser; callers should present
 /// the URL as a clickable link instead so the local client can open it.
 pub fn open_browser_url(url: &str) -> UrlOpenOutcome {
+    if validate_browser_url(url).is_err() {
+        return UrlOpenOutcome::OfferedLink;
+    }
     if running_over_ssh() {
         return UrlOpenOutcome::OfferedLink;
     }
@@ -86,6 +95,35 @@ pub fn open_browser_url(url: &str) -> UrlOpenOutcome {
     }
 }
 
+/// Validate the raw value before URL parsing can strip or encode controls.
+pub fn validate_browser_url(value: &str) -> anyhow::Result<url::Url> {
+    anyhow::ensure!(
+        !value.chars().any(char::is_control),
+        "Portboard URL contains control characters"
+    );
+    let parsed = url::Url::parse(value).map_err(|_| anyhow::anyhow!("Portboard URL is invalid"))?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some(),
+        "Portboard URL requires HTTP or HTTPS and a host"
+    );
+    Ok(parsed)
+}
+
+/// Convert a kernel TCP bind address into a browser authority, consistently.
+pub fn listener_browser_url(address: &str, port: u16) -> String {
+    let address = address.trim_matches(['[', ']']);
+    let host = match address {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
+}
+
 fn running_over_ssh() -> bool {
     ["SSH_CONNECTION", "SSH_TTY"]
         .iter()
@@ -100,6 +138,27 @@ mod tests {
     use crate::launch_target_config::parse_launch_target_config;
 
     use super::{browser_url, osc8_hyperlink};
+
+    #[test]
+    fn rejects_terminal_control_urls() {
+        let malicious = "http://localhost:3000/\x07\x1b]52;c;AAAA\x07";
+        assert!(!osc8_hyperlink(malicious).contains('\x07'));
+        assert!(!osc8_hyperlink(malicious).contains('\x1b'));
+    }
+
+    #[test]
+    fn ipv6_and_wildcard_listeners_are_browser_ready() {
+        for (address, expected) in [
+            ("::1", "http://[::1]:4100"),
+            ("::", "http://[::1]:4100"),
+            ("0.0.0.0", "http://127.0.0.1:4100"),
+        ] {
+            assert_eq!(
+                browser_url(&stopped_status_with_listeners(&[(address, 4100)])).as_deref(),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn prefers_the_primary_named_endpoint() {

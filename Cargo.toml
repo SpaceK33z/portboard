@@ -2,7 +2,7 @@
 name = "portboard"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 description = "Inspect and open development processes for the current workspace"
 license = "MIT"
 

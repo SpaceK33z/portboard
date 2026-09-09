@@ -26,7 +26,7 @@ Use the CLI, local dashboard, or optional [Herdr](https://herdr.dev) popup.
 
 ## Try it
 
-Requires **Linux with procfs**, **Git**, and **Rust 1.87+** to build. Herdr is optional.
+Requires **Linux with procfs**, **Git**, and **Rust 1.88+** to build. Log reading uses **GNU coreutils `tail`**. Herdr is optional.
 
 ```bash
 # From this checkout
@@ -116,7 +116,7 @@ portboard ensure dev --herdr --wait
 portboard status --json
 ```
 
-Create a dedicated server tab without changing focus. `--wait` checks the matching process and primary HTTP endpoint for up to 30 seconds; `ensure --herdr` refuses manually launched or background runs rather than silently starting another.
+Create a dedicated server tab without changing focus. `--wait` checks the matching process and primary HTTP endpoint for up to 30 seconds; `ensure --herdr` refuses duplicate, manually launched, or background runs rather than silently starting another. Readiness supports plain HTTP to IP literals or `localhost`; HTTPS and other DNS names remain usable as browser links, but are not supported readiness probes.
 
 ## Go deeper
 

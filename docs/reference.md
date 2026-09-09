@@ -80,13 +80,15 @@ process_match = ["scripts/dev_worker.py"]
 }
 ```
 
+Runtime metadata is ignored for stopped targets. Live metadata errors are isolated to their target (`metadata_error` in JSON) and reported as warnings in text, the panel, and dashboard; other targets remain inspectable. Runtime files must resolve inside the canonical worktree, be regular files, and contain at most 1 MiB. External symlinks and special files are rejected. Like `log_file` containment, canonical-path checks assume a trusted worktree: concurrent replacement of ancestor directories can race validation; this is not a sandbox against a malicious local filesystem writer. The final runtime file is opened without following symlinks and nonblocking to avoid special-file hangs.
+
 An endpoint may carry an optional project-owned `status` string (for example the `starting`, `running`, or `failed` lifecycle of an optional supervised server). Portboard accepts and round-trips it in JSON output without interpreting it.
 
 `log_file` is an optional project-owned log path relative to the worktree. `portboard logs` reads that file directly, so it works for Herdr-hosted runs and survives Portboard process restarts.
 
 Unknown manifest or runtime fields, duplicate IDs, blank values, unsafe relative paths, invalid URLs, and control characters in labels are rejected instead of being silently ignored.
 
-Portboard uses an advisory per-worktree/target launch lock and records the launched root PID plus its Linux start time. Until the configured signature becomes visible or that exact launcher exits, another Portboard process reports the target as starting instead of launching a duplicate. This covers delayed startup across CLI processes and multiple dashboard servers without confusing a reused numeric PID for the original launcher.
+Portboard uses an advisory per-worktree/target launch lock and records the launched root PID plus its Linux start time. Until that exact launcher exits, its reservation is retained; when no matching run is visible, another Portboard process reports the target as starting instead of launching a duplicate. Stop holds the same launch lock through bounded TERM-to-KILL shutdown and clears the reservation only after confirming exit. This covers delayed startup across CLI processes and multiple dashboard servers without confusing a reused numeric PID for the original launcher.
 
 Duplicates are surfaced, never merged into a healthy state. When more than one live process matches a target's signature, text status reports `running · DUPLICATE (N instances)`, JSON status sets `"duplicate": true`, the popup shows `duplicate!`, and the dashboard highlights the row in red; `portboard open` refuses to focus or start anything and lists every matching PID with its argument vector. A process whose command line matches two launch targets is reported as a warning in status output, the popup header, and the dashboard API so overlapping `process_match` signatures get fixed in the manifest.
 
@@ -105,7 +107,7 @@ portboard status
 portboard status --json
 ```
 
-Text status prefers named endpoint URLs and falls back to discovered listener addresses. JSON status includes the target argument vector, revalidated processes, raw `endpoints`, and browser-ready `named_endpoints`.
+Text status prefers named endpoint URLs and falls back to discovered listener addresses. JSON status preserves its array of target rows and includes the target argument vector, revalidated processes, raw `endpoints`, and browser-ready `named_endpoints`. When warnings exist, each row also carries the worktree-wide `findings` array; target-local runtime failures additionally carry `metadata_error`.
 
 List every process running inside the current worktree, with or without a manifest:
 
@@ -128,11 +130,11 @@ portboard logs dev --follow
 portboard stop dev
 ```
 
-`ensure --herdr` requires a current Herdr workspace and a Portboard-owned target process. It creates a dedicated tab when stopped, refuses a matching background or manually launched process, and never falls back to detached execution. `--wait` waits up to 30 seconds for the matching process and the primary HTTP endpoint to return a 2xx or 3xx response. Even without `--wait`, when another start holds an active launch reservation, `ensure` waits up to 30 seconds for that process signature to appear and fails if it never does. The command prints the primary URL after readiness.
+`ensure --herdr` requires a current Herdr workspace and a Portboard-owned target process. It creates a dedicated tab when stopped, refuses a matching background or manually launched process, and never falls back to detached execution. `--wait` waits up to 30 seconds for the matching process and the primary HTTP endpoint to return a 2xx or 3xx response. Even without `--wait`, when another start holds an active launch reservation, `ensure` waits up to 30 seconds for that process signature to appear and fails if it never does. The command prints the primary URL after readiness. Readiness supports only plain HTTP to IP literals (including IPv6) or exact `localhost`; it never invokes an unbounded DNS resolver. Other DNS names and HTTPS primary endpoints report explicit unsupported-readiness errors. HTTPS URLs remain valid for inspection and browser opening, but cannot be used with `--wait`. Network connect/write/read probes share the absolute wait deadline, each probe is capped at 500 ms, and status lines are limited to 4096 bytes. Process/metadata inspection still uses ordinary local procfs/filesystem operations.
 
 `logs` dispatches by run host. A target that declares `log_file` is read directly from that file, so it works for Herdr-hosted runs and survives Portboard process restarts. Otherwise a Herdr-hosted run is focused in its owning tab, a dashboard-owned run is tailed from the newest log below the Portboard state directory (even after the run exits, so crashes stay inspectable), and a manually started run reports its PIDs with a note that its output is attached to the starting terminal. The last 200 lines print by default; `--lines N` changes the bound and `--follow` keeps streaming new output.
 
-`stop` revalidates matching PIDs before sending `SIGTERM`, waits up to five seconds for them to exit, then escalates to `SIGKILL` for survivors so a hung process cannot linger as `running`. When the run has Portboard identity and belongs to the current Herdr workspace, Portboard waits for shutdown and closes its dedicated tab.
+`stop` revalidates matching PIDs before sending `SIGTERM`, waits up to five seconds for them to exit, then escalates to `SIGKILL` for survivors so a hung process cannot linger as `running`. When the run has Portboard identity and belongs to the current Herdr workspace, Portboard waits for shutdown and closes its tab only if every split is an idle Portboard-owned host shell. Busy, unrelated, or uninspectable splits preserve the tab.
 
 `url` prints the primary endpoint URL, or a named endpoint when given. On a terminal it emits the URL as an OSC 8 hyperlink, so ctrl-clicking the output opens it. `--open` additionally launches a browser through `xdg-open` when Portboard runs on a local desktop. Over SSH — including panes on a remote Herdr server reached with `herdr --remote` — Portboard never starts a browser on the server; it prints the clickable URL, and ctrl-clicking is handled by the local Herdr client, which opens it in your local browser.
 
@@ -160,7 +162,9 @@ portboard serve
 
 The default address is `http://127.0.0.1:9777`. Use `--bind 127.0.0.1:PORT` to select another loopback port and `--cwd PATH` to select a worktree. Non-loopback bind addresses are rejected.
 
-The dashboard polls `GET /api/status` and can start and stop targets. State-changing requests require the per-server `X-Portboard-Token` embedded in the dashboard page. Commands started by the dashboard are detached into their own process groups; stdout and stderr are written to timestamped per-worktree logs below the Portboard state directory. Each start creates a new `{target}.{timestamp}.log` file, a stable `{target}.log` symlink always points at the newest run, and older logs are pruned to the newest five so previous runs remain inspectable after a crash or restart. Stop sends `SIGTERM` to the complete dashboard-owned process group. For a manually started matching target, stop sends `SIGTERM` to each revalidated matching PID and escalates to `SIGKILL` after the grace period.
+The dashboard polls `GET /api/status` and can start and stop targets. State-changing requests require the per-server `X-Portboard-Token` embedded in the dashboard page. Commands started by the dashboard are detached into their own process groups; stdout and stderr are written to timestamped per-worktree logs below the Portboard state directory. Each start creates a new `{target}.{timestamp}.log` file, a stable `{target}.log` symlink always points at the newest run, and older logs are pruned to the newest five so previous runs remain inspectable after a crash or restart. Stop captures exact PID/start-time identities for dashboard-owned group members and matching process trees, sends `SIGTERM`, escalates survivors to `SIGKILL` after five seconds, and confirms exit. Group membership alone never authorizes signaling: a per-launch inherited ownership token prevents a recycled group ID from claiming unrelated processes.
+
+The dashboard uses a bounded header-only HTTP transport: at most 16 pending connections, 8192-byte headers, and a 250 ms absolute header deadline. Responses have a 250 ms write deadline. It closes each connection without reading or draining request bodies; unfinished Content-Length/chunked bodies cannot block subsequent requests or child reaping. There are no per-connection worker threads or unbounded application request queues. Authorized mutations run serially on one worker with an eight-request queue (overflow returns 503), so target locks and confirmed shutdown do not block status handling or the independent child reaper. Host validation precedes token validation, including for requests declaring bodies.
 
 The dashboard supervisor and its in-memory child handles exist for the lifetime of `portboard serve`. Runs remain discoverable through `/proc` if the dashboard exits, but a restarted dashboard does not regain the original `Child` handle or log stream.
 
@@ -215,7 +219,7 @@ Runs started through the Herdr adapter survive laptop disconnects because the re
 - **Click** a target row to select it, or click an endpoint or port row to open that URL directly.
 - Endpoint URLs are shown as plain text, so Herdr's client-side ctrl-click opens them and terminal text selection can copy them. This still works through `herdr --remote`: the click is handled by the local Herdr client, so the URL opens in your local browser even though the run lives on the remote server. Keep in mind the URL still says `localhost`, so the port must be reachable locally (for example through an SSH tunnel) for the page to load.
 
-Without a `portboard.toml`, the panel lists the live process inventory in the worktree instead of launch targets, with each process's listening ports inline. The worktree-wide ports list is always visible either way: Portboard shows every listener it can attribute to a worktree process even when nothing is declared in a manifest.
+Without a `portboard.toml`, the panel lists the live process inventory in the worktree instead of launch targets, with each process's listening ports inline, a scrollable process selection, and a dedicated ports list. Empty or invalid manifests retain this inventory; configuration warnings remain visible. The worktree-wide ports list is always visible either way: Portboard shows every listener it can attribute to a worktree process even when nothing is declared in a manifest.
 
 The popup is backed by the same current-worktree configuration, process discovery, endpoint discovery, duplicate-prevention, and stop code as the standalone interfaces. It does not add a worktree picker or global process browser.
 
@@ -225,7 +229,7 @@ Portboard's current Linux discovery path is deliberately small and deterministic
 
 1. Resolve and canonicalize the current Git worktree.
 2. Scan numeric `/proc` entries for command-line signatures whose cwd is inside that worktree.
-3. Re-read each process start time before accepting it, preventing stale PID reuse from becoming a live run.
+3. Re-read each process start time before accepting it, preventing stale PID reuse from becoming a live run. Reuse one discovery snapshot across configured targets; combine independent signature/identity-bearing trees while collapsing descendants already represented by a matching ancestor. Retain exact signature-member identities for coordinator-owned runtime metadata.
 4. Accept configured runtime metadata only when its owner PID is a current matching process.
 5. Walk matching process descendants, map their socket file descriptors to `/proc/net/tcp` and `/proc/net/tcp6`, and report listening TCP addresses.
 6. For `ensure --wait`, request the primary HTTP endpoint until it returns a 2xx or 3xx response.
@@ -267,7 +271,8 @@ Presentations
 
 - Linux with procfs
 - Git
-- Rust 1.87 or newer when building from source
+- Rust 1.88 or newer when building from source (validated with the locked dependencies)
+- GNU coreutils `tail` for project and dashboard log reading
 - Optional: Herdr 0.7.4 or newer
 
 ## Alternatives

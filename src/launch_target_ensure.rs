@@ -56,7 +56,6 @@ pub fn ensure_launch_target_in_herdr(
     }
     let processes = find_launch_target_processes(worktree_root, target)?;
     if !processes.is_empty() {
-        launch_lock.clear()?;
         require_portboard_herdr_run(&workspace_id, target, &processes)?;
         let primary_endpoint = wait_if_requested(worktree_root, target, wait_until_ready)?;
         return Ok(EnsureLaunchTargetResult {
@@ -92,6 +91,9 @@ fn require_portboard_herdr_run(
     target: &LaunchTarget,
     processes: &[LaunchTargetProcess],
 ) -> Result<()> {
+    if processes.len() > 1 {
+        bail!("Portboard launch target `{}` has {} duplicate instances, including runs outside its Portboard-owned Herdr tab", target.id.as_str(), processes.len());
+    }
     let owned_processes = processes
         .iter()
         .filter(|process| process_has_portboard_target_identity(process, target.id.as_str()))

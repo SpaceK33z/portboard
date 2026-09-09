@@ -4,10 +4,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::launch_target_config::LaunchTarget;
-use crate::launch_target_processes::{
-    find_launch_target_processes, find_worktree_processes, LaunchTargetProcess,
-};
-use crate::process_endpoints::{find_process_endpoints_by_process, ProcessEndpoint};
+use crate::launch_target_processes::DiscoverySnapshot;
+use crate::process_endpoints::ProcessEndpoint;
 
 /// One running worktree process together with the launch targets that claim it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -28,10 +26,18 @@ pub fn inspect_worktree_processes(
     worktree_root: &Path,
     targets: &[LaunchTarget],
 ) -> Result<Vec<WorktreeProcessInventoryEntry>> {
-    let processes = find_worktree_processes(worktree_root)?;
+    let snapshot = DiscoverySnapshot::capture(worktree_root)?;
+    inspect_worktree_processes_with_snapshot(targets, &snapshot)
+}
+
+pub fn inspect_worktree_processes_with_snapshot(
+    targets: &[LaunchTarget],
+    snapshot: &DiscoverySnapshot,
+) -> Result<Vec<WorktreeProcessInventoryEntry>> {
+    let processes = snapshot.processes.clone();
     let mut claims = vec![Vec::new(); processes.len()];
     for target in targets {
-        for claimed in find_launch_target_processes(worktree_root, target)? {
+        for claimed in snapshot.target_processes(target) {
             if let Some(index) = processes
                 .iter()
                 .position(|process| process.pid == claimed.pid)
@@ -42,15 +48,7 @@ pub fn inspect_worktree_processes(
     }
     // One grouped scan attributes every listener in the worktree to its owning
     // process so the inventory can show ports with or without a manifest.
-    let endpoint_groups = find_process_endpoints_by_process(
-        &processes
-            .iter()
-            .map(|process| LaunchTargetProcess {
-                pid: process.pid,
-                argv: Vec::new(),
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    let endpoint_groups = snapshot.endpoints_by_process()?;
     Ok(processes
         .into_iter()
         .zip(claims)

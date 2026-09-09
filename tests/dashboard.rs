@@ -50,6 +50,9 @@ fn request(
     body: &str,
 ) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("dashboard connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("bounded test response");
     let token_header = token
         .map(|token| format!("X-Portboard-Token: {token}\r\n"))
         .unwrap_or_default();
@@ -204,4 +207,268 @@ process_match = ["{marker}"]
         fs::read_to_string(repository.path().join("starts")).expect("start marker"),
         "x"
     );
+}
+
+#[test]
+fn unfinished_bodies_and_slow_connections_do_not_block_status() {
+    let repository = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("portboard.toml"), "version = 1\n[[launch_targets]]\nid = \"probe\"\nlabel = \"Probe\"\nargv = [\"missing-command\"]\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let _server = start_server(&repository, &state, port);
+    wait_until_ready(port);
+    let mut attacker = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        attacker,
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 1025\r\n\r\n"
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let start = Instant::now();
+    let mut healthy = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    healthy
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        healthy,
+        "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    healthy
+        .read_to_string(&mut response)
+        .expect("status must not wait for attacker body");
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    let mut idle = Vec::new();
+    for _ in 0..48 {
+        idle.push(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    }
+    thread::sleep(Duration::from_millis(700));
+    for mut stream in idle {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut byte = [0];
+        assert!(
+            matches!(stream.read(&mut byte), Ok(0)),
+            "idle connections must close"
+        );
+    }
+}
+
+#[test]
+fn oversized_headers_and_body_attacks_preserve_authorization_and_reaping() {
+    let repository = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("portboard.toml"), "version = 1\n[[launch_targets]]\nid = \"probe\"\nlabel = \"Probe\"\nargv = [\"sh\", \"fixture.sh\"]\nprocess_match = [\"portboard-bounded-http-never-match\"]\n").unwrap();
+    fs::write(
+        repository.path().join("fixture.sh"),
+        "echo $$ > fixture.pid\nread line < gate\n",
+    )
+    .unwrap();
+    let gate_path = repository.path().join("gate");
+    let gate_name = std::ffi::CString::new(gate_path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(gate_name.as_ptr(), 0o600) }, 0);
+    struct Release(fs::File);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.write_all(b"exit\n");
+        }
+    }
+    let release = Release(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(gate_path)
+            .unwrap(),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let server = start_server(&repository, &state, port);
+    wait_until_ready(port);
+    let host = format!("127.0.0.1:{port}");
+    let html = request(port, &host, "GET", "/", None, "");
+    let token = dashboard_token(response_body(&html));
+    // On assertion failure (including the reaping mutation), ask the fixture
+    // server to stop/wait its child before ServerProcess kills the server.
+    struct CleanupFixture(u16, String, String);
+    impl Drop for CleanupFixture {
+        fn drop(&mut self) {
+            let _ = std::panic::catch_unwind(|| {
+                request(
+                    self.0,
+                    &self.1,
+                    "POST",
+                    "/api/stop/probe",
+                    Some(&self.2),
+                    "",
+                )
+            });
+        }
+    }
+    let _cleanup = CleanupFixture(port, host.clone(), token.to_string());
+    assert!(request(port, &host, "POST", "/api/open/probe", Some(token), "").contains("started"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let fixture: u32 = loop {
+        if let Ok(pid) = fs::read_to_string(repository.path().join("fixture.pid")) {
+            if let Ok(pid) = pid.trim().parse() {
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "fixture never started");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let identity =
+        portboard::process_identity::ProcessIdentity::read(fixture).expect("live fixture");
+    assert!(identity.is_live());
+    let owner = fs::read_dir(format!("/proc/{}/task", server.0.id()))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|task| {
+            fs::read_to_string(task.path().join("children"))
+                .unwrap_or_default()
+                .split_whitespace()
+                .any(|pid| pid == fixture.to_string())
+        })
+        .expect("fixture must be a dashboard-owned child");
+    assert_ne!(
+        owner.file_name().to_str().unwrap(),
+        server.0.id().to_string(),
+        "fixture must belong to the mutation worker, not the main task"
+    );
+    for (host, expected) in [
+        ("attacker.example".to_string(), "421"),
+        (host.clone(), "403"),
+    ] {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /api/open/probe HTTP/1.1\r\nHost: {host}\r\nContent-Length: 999999999\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {expected}")));
+    }
+    let mut attacker = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        attacker,
+        "GET / HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n"
+    )
+    .unwrap();
+    let mut oversized = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let _ =
+        oversized.write_all(format!("GET / HTTP/1.1\r\nX-Large: {}", "x".repeat(20000)).as_bytes());
+    let mut byte = [0];
+    match oversized.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("oversized headers must close, not time out: {other:?}"),
+    }
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while fs::metadata(format!("/proc/{fixture}")).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "dashboard must reap actual worker-owned fixture {fixture}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!identity.is_live());
+    assert!(request(port, &host, "GET", "/api/status", None, "").starts_with("HTTP/1.1 200"));
+}
+
+#[test]
+fn blocked_mutation_does_not_block_status_requests() {
+    use sha2::{Digest, Sha256};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let repository = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(repository.path())
+        .status()
+        .unwrap();
+    fs::write(repository.path().join("portboard.toml"), "version = 1\n[[launch_targets]]\nid = \"probe\"\nlabel = \"Probe\"\nargv = [\"missing-command\"]\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(
+            repository
+                .path()
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+        )
+    );
+    let locks = state.path().join("worktrees").join(hash).join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let lock = fs::File::create(locks.join("probe.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let port = free_port();
+    let _server = start_server(&repository, &state, port);
+    wait_until_ready(port);
+    let host = format!("127.0.0.1:{port}");
+    let html = request(port, &host, "GET", "/", None, "");
+    let token = dashboard_token(response_body(&html)).to_string();
+    let stop_host = host.clone();
+    let queue_token = token.clone();
+    let mutation = thread::spawn(move || {
+        request(
+            port,
+            &stop_host,
+            "POST",
+            "/api/stop/probe",
+            Some(&token),
+            "",
+        )
+    });
+    thread::sleep(Duration::from_millis(100));
+    let mut queued = Vec::new();
+    for _ in 0..8 {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(stream, "POST /api/stop/probe HTTP/1.1\r\nHost: {host}\r\nX-Portboard-Token: {queue_token}\r\n\r\n").unwrap();
+        queued.push(stream);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let overflow = request(
+        port,
+        &host,
+        "POST",
+        "/api/stop/probe",
+        Some(&queue_token),
+        "",
+    );
+    assert!(
+        overflow.starts_with("HTTP/1.1 503"),
+        "bounded queue overflow: {overflow}"
+    );
+    let mut healthy = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    healthy
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    write!(healthy, "GET /api/status HTTP/1.1\r\nHost: {host}\r\n\r\n").unwrap();
+    let mut response = String::new();
+    let result = healthy.read_to_string(&mut response);
+    drop(lock);
+    assert!(mutation.join().unwrap().starts_with("HTTP/1.1 200"));
+    result.expect("mutation lock must not block HTTP status");
+    assert!(response.starts_with("HTTP/1.1 200"));
 }

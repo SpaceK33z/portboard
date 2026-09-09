@@ -44,15 +44,15 @@ pub fn find_process_endpoints_by_process(
         .map(|process| process.pid)
         .collect::<HashSet<_>>();
     let parents = read_process_parents()?;
-    // Map every owned socket inode to the root process whose tree holds it so
-    // one pass over the kernel TCP tables can attribute each listener.
-    let mut socket_owners: HashMap<u64, u32> = HashMap::new();
+    // Inherited descriptors may belong to several roots. Retain every owner
+    // instead of letting hash iteration order select a different winner.
+    let mut socket_owners: HashMap<u64, HashSet<u32>> = HashMap::new();
     for pid in parents.keys().copied().chain(roots.iter().copied()) {
         let Some(root) = owning_root(pid, &roots, &parents) else {
             continue;
         };
         for inode in process_socket_inodes(pid) {
-            socket_owners.insert(inode, root);
+            socket_owners.entry(inode).or_default().insert(root);
         }
     }
     read_tcp_endpoints(
@@ -135,7 +135,7 @@ fn process_socket_inodes(pid: u32) -> Vec<u64> {
 fn read_tcp_endpoints(
     path: &Path,
     ipv6: bool,
-    socket_owners: &HashMap<u64, u32>,
+    socket_owners: &HashMap<u64, HashSet<u32>>,
     output: &mut HashMap<u32, Vec<ProcessEndpoint>>,
 ) -> Result<()> {
     let contents = match fs::read_to_string(path) {
@@ -155,17 +155,19 @@ fn read_tcp_endpoints(
         let Some(inode) = fields[9].parse::<u64>().ok() else {
             continue;
         };
-        let Some(&root) = socket_owners.get(&inode) else {
+        let Some(roots) = socket_owners.get(&inode) else {
             continue;
         };
         let Some((address, port)) = parse_local_address(fields[1], ipv6) else {
             continue;
         };
-        output.entry(root).or_default().push(ProcessEndpoint {
-            protocol: "tcp",
-            address,
-            port,
-        });
+        for &root in roots {
+            output.entry(root).or_default().push(ProcessEndpoint {
+                protocol: "tcp",
+                address: address.clone(),
+                port,
+            });
+        }
     }
     Ok(())
 }
@@ -214,7 +216,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
         let port = listener.local_addr().expect("listener address").port();
         let processes = vec![LaunchTargetProcess {
+            metadata_members: Vec::new(),
             pid: std::process::id(),
+            start_time: crate::process_identity::ProcessIdentity::read(std::process::id())
+                .unwrap()
+                .start_time,
             argv: Vec::new(),
         }];
 
@@ -230,7 +236,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
         let port = listener.local_addr().expect("listener address").port();
         let processes = vec![LaunchTargetProcess {
+            metadata_members: Vec::new(),
             pid: std::process::id(),
+            start_time: crate::process_identity::ProcessIdentity::read(std::process::id())
+                .unwrap()
+                .start_time,
             argv: Vec::new(),
         }];
 
@@ -242,5 +252,48 @@ mod tests {
         assert!(owned
             .iter()
             .any(|endpoint| endpoint.address == "127.0.0.1" && endpoint.port == port));
+    }
+    #[test]
+    fn inherited_listener_is_attributed_to_every_owning_root() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let fd = listener.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pids = [std::process::id(), child.id()];
+        let processes = pids
+            .iter()
+            .map(|&pid| LaunchTargetProcess {
+                metadata_members: Vec::new(),
+                pid,
+                start_time: crate::process_identity::ProcessIdentity::read(pid)
+                    .unwrap()
+                    .start_time,
+                argv: vec![],
+            })
+            .collect::<Vec<_>>();
+        let result = find_process_endpoints_by_process(&processes);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let grouped = result.unwrap();
+        for pid in pids {
+            assert!(
+                grouped
+                    .get(&pid)
+                    .is_some_and(|e| e.iter().any(|e| e.port == port)),
+                "missing owner {pid}: {grouped:?}"
+            );
+        }
     }
 }

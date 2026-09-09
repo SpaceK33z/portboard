@@ -53,64 +53,23 @@ impl LaunchTargetLock {
         Ok(self.active_reservation()?.map(|(pid, _)| pid))
     }
 
-    /// Sends SIGTERM to the exact reserved launcher process and clears the reservation.
+    pub fn active_reservation_identity(
+        &mut self,
+    ) -> Result<Option<crate::process_identity::ProcessIdentity>> {
+        Ok(self
+            .active_reservation()?
+            .map(|(pid, start_time)| crate::process_identity::ProcessIdentity { pid, start_time }))
+    }
+
+    /// Retains the lock and reservation until the exact launcher has exited.
     pub fn cancel_active_reservation(&mut self) -> Result<Option<u32>> {
-        let Some((pid, expected_start_time)) = self.active_reservation()? else {
+        let Some(identity) = self.active_reservation_identity()? else {
             return Ok(None);
         };
-        // SAFETY: pidfd_open consumes only the numeric PID and returns a new descriptor.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as i32, 0) };
-        if descriptor >= 0 {
-            if process_start_time(pid) != Some(expected_start_time) {
-                // SAFETY: this branch owns the descriptor returned above.
-                unsafe {
-                    libc::close(descriptor as i32);
-                }
-                self.clear()?;
-                return Ok(None);
-            }
-            // SAFETY: pidfd_send_signal uses the owned descriptor and no siginfo pointer.
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    descriptor as i32,
-                    libc::SIGTERM,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            let error = io::Error::last_os_error();
-            // SAFETY: this branch owns the descriptor returned above.
-            unsafe {
-                libc::close(descriptor as i32);
-            }
-            if result != 0 && error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).with_context(|| {
-                    format!("Portboard could not cancel reserved launcher pid {pid}")
-                });
-            }
-        } else {
-            let error = io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
-                return Err(error).with_context(|| {
-                    format!("Portboard could not open reserved launcher pid {pid}")
-                });
-            }
-            if process_start_time(pid) == Some(expected_start_time) {
-                // SAFETY: the PID and start time were revalidated immediately above.
-                let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                if result != 0 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        return Err(error).with_context(|| {
-                            format!("Portboard could not cancel reserved launcher pid {pid}")
-                        });
-                    }
-                }
-            }
-        }
+        let identities = crate::process_identity::process_trees(&[identity])?;
+        crate::launch_target_stop::stop_process_identities(&identities)?;
         self.clear()?;
-        Ok(Some(pid))
+        Ok(Some(identity.pid))
     }
 
     fn active_reservation(&mut self) -> Result<Option<(u32, u64)>> {
@@ -146,7 +105,7 @@ impl LaunchTargetLock {
         Ok(true)
     }
 
-    /// Clears a reservation after a matching run is visible or confirmed gone.
+    /// Clears a reservation only after its launcher and stopped run are confirmed gone.
     pub fn clear(&mut self) -> Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
@@ -156,13 +115,7 @@ impl LaunchTargetLock {
 }
 
 fn process_start_time(pid: u32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
+    crate::process_identity::ProcessIdentity::read(pid).map(|identity| identity.start_time)
 }
 
 fn lock_directory(worktree_root: &Path) -> Result<std::path::PathBuf> {
@@ -178,13 +131,79 @@ mod tests {
     use super::LaunchTargetLock;
 
     #[test]
+    fn cancellation_serializes_open_and_keeps_reservation_during_grace() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let config = parse_launch_target_config(
+            r#"version = 1
+[[launch_targets]]
+id = "race"
+label = "Race"
+argv = ["never-visible"]
+"#,
+        )
+        .unwrap();
+        let mut child = Command::new("bash")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut lock = LaunchTargetLock::acquire(root.path(), &config.launch_targets[0]).unwrap();
+        lock.reserve_process(child.id()).unwrap();
+        let path = super::lock_directory(root.path())
+            .unwrap()
+            .join("race.lock");
+        let worker = std::thread::spawn(move || lock.cancel_active_reservation());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let contender = std::fs::File::open(&path).unwrap();
+        let locked =
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+        let reserved = !std::fs::read_to_string(path).unwrap().is_empty();
+        worker.join().unwrap().unwrap();
+        child.wait().unwrap();
+        assert!(
+            locked,
+            "open must not enter its scan/start critical section during stop"
+        );
+        assert!(reserved, "reservation must survive the TERM grace window");
+    }
+
+    #[test]
+    fn cancellation_waits_for_term_ignoring_reservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = parse_launch_target_config(
+            r#"version = 1
+[[launch_targets]]
+id = "reserved"
+label = "Reserved"
+argv = ["never-visible"]
+"#,
+        )
+        .unwrap();
+        let mut child = Command::new("bash")
+            .args(["-c", "trap '' TERM; exec sleep 30"])
+            .current_dir(temporary.path())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut lock =
+            LaunchTargetLock::acquire(temporary.path(), &config.launch_targets[0]).unwrap();
+        lock.reserve_process(child.id()).unwrap();
+        lock.cancel_active_reservation().unwrap();
+        let exited = child.try_wait().unwrap().is_some();
+        if !exited {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+        assert!(
+            exited,
+            "reservation must not be released while launcher survives"
+        );
+    }
+
+    #[test]
     fn reservation_tracks_process_identity_and_clears_after_exit() {
         let temporary = tempfile::tempdir().expect("temporary worktree");
-        let state = tempfile::tempdir().expect("temporary state");
-        // Tests call the state-path helper through this process-wide override;
-        // this module has one test and does not run alongside integration tests
-        // in the same test process.
-        std::env::set_var("PORTBOARD_STATE_DIR", state.path());
         let config = parse_launch_target_config(
             r#"
 version = 1
@@ -213,6 +232,5 @@ argv = ["sleep", "30"]
         );
         child.wait().expect("wait");
         assert!(!lock.has_active_reservation().expect("cancelled"));
-        std::env::remove_var("PORTBOARD_STATE_DIR");
     }
 }

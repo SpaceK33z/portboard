@@ -1,10 +1,8 @@
 use std::env;
-use std::fs::{self, File};
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
@@ -29,16 +27,17 @@ use crate::worktree_processes::inspect_worktree_processes;
 /// Runs the Portboard command line interface for the current workspace.
 pub fn run_portboard_cli(arguments: &[String]) -> Result<()> {
     let command = arguments.first().map(String::as_str).unwrap_or("status");
+    let options = arguments.get(1..).unwrap_or_default();
     match command {
-        "status" => run_status_command(&arguments[1..]),
-        "ps" => run_ps_command(&arguments[1..]),
-        "open" => run_open_command(&arguments[1..]),
-        "ensure" => run_ensure_command(&arguments[1..]),
-        "url" => run_url_command(&arguments[1..]),
-        "open-url" => run_open_url_command(&arguments[1..]),
-        "logs" => run_logs_command(&arguments[1..]),
-        "stop" => run_stop_command(&arguments[1..]),
-        "serve" => run_serve_command(&arguments[1..]),
+        "status" => run_status_command(options),
+        "ps" => run_ps_command(options),
+        "open" => run_open_command(options),
+        "ensure" => run_ensure_command(options),
+        "url" => run_url_command(options),
+        "open-url" => run_open_url_command(options),
+        "logs" => run_logs_command(options),
+        "stop" => run_stop_command(options),
+        "serve" => run_serve_command(options),
         "panel" => {
             let root = resolve_cli_worktree(None)?;
             open_current_workspace_panel(&root)
@@ -76,7 +75,14 @@ fn run_status_command(arguments: &[String]) -> Result<()> {
     let config = load_worktree_launch_targets(&root)?;
     let inspection = inspect_worktree_launch_targets(&root, &config)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&inspection.statuses)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json(&inspection)?)?
+        );
+        // Preserve the documented JSON array while retaining cross-target warnings.
+        for finding in &inspection.findings {
+            eprintln!("warning: {finding}");
+        }
     } else {
         println!("Portboard · {}", root.display());
         for status in &inspection.statuses {
@@ -84,7 +90,9 @@ fn run_status_command(arguments: &[String]) -> Result<()> {
                 status
                     .endpoints
                     .iter()
-                    .map(|endpoint| format!("{}:{}", endpoint.address, endpoint.port))
+                    .map(|endpoint| {
+                        crate::browser_url::listener_browser_url(&endpoint.address, endpoint.port)
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             } else {
@@ -124,6 +132,20 @@ fn run_status_command(arguments: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Keep the public status array and its existing fields. Each row carries the
+// worktree-wide findings so JSON-only consumers do not silently lose warnings.
+fn status_json(
+    inspection: &crate::current_workspace_status::WorktreeLaunchTargetInspection,
+) -> Result<serde_json::Value> {
+    let mut rows = serde_json::to_value(&inspection.statuses)?;
+    if !inspection.findings.is_empty() {
+        for row in rows.as_array_mut().expect("status array") {
+            row["findings"] = serde_json::to_value(&inspection.findings)?;
+        }
+    }
+    Ok(rows)
 }
 
 fn run_ps_command(arguments: &[String]) -> Result<()> {
@@ -365,9 +387,7 @@ fn run_open_url_command(arguments: &[String]) -> Result<()> {
         .context("Portboard open-url needs a URL argument or HERDR_PLUGIN_CLICKED_URL")?;
     // The manifest pattern already restricts clicks to loopback http(s) URLs;
     // revalidate here so this command is safe to invoke by hand too.
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        bail!("Portboard open-url only opens http and https URLs, got `{url}`");
-    }
+    crate::browser_url::validate_browser_url(&url)?;
     match open_browser_url(&url) {
         UrlOpenOutcome::OpenedLocally => println!("opened {url}"),
         UrlOpenOutcome::OfferedLink => {
@@ -489,19 +509,7 @@ fn print_project_log(
             configured_log_path.display()
         );
     }
-    let mut command = Command::new("tail");
-    command.arg("-n").arg(line_count.to_string());
-    if follow {
-        command.arg("-F");
-    }
-    let status = command
-        .arg(&log_path)
-        .status()
-        .with_context(|| format!("Portboard could not read {}", log_path.display()))?;
-    if !status.success() {
-        bail!("Portboard log reader exited with {status}");
-    }
-    Ok(())
+    print_dashboard_log(&log_path, line_count, follow)
 }
 
 /// Returns the newest dashboard-owned run log for one target, preferring the
@@ -534,56 +542,20 @@ fn newest_dashboard_log(worktree_root: &Path, target_id: &str) -> Result<Option<
 /// Prints a bounded tail of one dashboard run log, then polls for appended
 /// output when following.
 fn print_dashboard_log(log_path: &Path, line_count: u32, follow: bool) -> Result<()> {
-    print_log_tail(log_path, line_count)?;
-    if !follow {
-        return Ok(());
+    // Reuse the system tail implementation for both run hosts. It streams
+    // bytes, seeks backwards for the initial tail, and follows file identity
+    // and name across appends, truncation, and replacement without a separate
+    // metadata/read offset race in Portboard.
+    let mut command = Command::new("tail");
+    command.arg("-n").arg(line_count.to_string());
+    if follow {
+        command.args(["-F", "--sleep-interval=0.1", "--max-unchanged-stats=1"]);
     }
-    let mut offset = fs::metadata(log_path)
-        .with_context(|| format!("Portboard could not read {}", log_path.display()))?
-        .len();
-    loop {
-        thread::sleep(Duration::from_millis(250));
-        let length = match fs::metadata(log_path) {
-            // A vanished or replaced log ends the follow quietly.
-            Err(_) => return Ok(()),
-            Ok(metadata) => metadata.len(),
-        };
-        if length < offset {
-            // The log was truncated or replaced; restart from the beginning.
-            offset = 0;
-        }
-        if length == offset {
-            continue;
-        }
-        let mut file = File::open(log_path)
-            .with_context(|| format!("Portboard could not read {}", log_path.display()))?;
-        file.seek(SeekFrom::Start(offset))
-            .with_context(|| format!("Portboard could not seek {}", log_path.display()))?;
-        let mut appended = Vec::new();
-        file.read_to_end(&mut appended)
-            .with_context(|| format!("Portboard could not read {}", log_path.display()))?;
-        offset = length;
-        print!("{}", String::from_utf8_lossy(&appended));
-        std::io::stdout()
-            .flush()
-            .context("Portboard logs could not write to stdout")?;
-    }
-}
-
-/// Prints the last `line_count` lines of one log file.
-fn print_log_tail(log_path: &Path, line_count: u32) -> Result<()> {
-    let mut contents = Vec::new();
-    File::open(log_path)
-        .with_context(|| format!("Portboard could not read {}", log_path.display()))?
-        .read_to_end(&mut contents)
-        .with_context(|| format!("Portboard could not read {}", log_path.display()))?;
-    let rendered = String::from_utf8_lossy(&contents);
-    let lines: Vec<&str> = rendered.lines().collect::<Vec<_>>();
-    let skip = lines.len().saturating_sub(line_count as usize);
-    for line in &lines[skip..] {
-        println!("{line}");
-    }
-    Ok(())
+    command.arg("--").arg(log_path);
+    // Replace this reader rather than orphaning a tail subprocess if the CLI
+    // is terminated. No Portboard resources need cleanup after log dispatch.
+    use std::os::unix::process::CommandExt;
+    Err(command.exec()).with_context(|| format!("Portboard could not read {}", log_path.display()))
 }
 
 fn run_stop_command(arguments: &[String]) -> Result<()> {
@@ -708,4 +680,24 @@ fn print_usage() {
     println!(
         "Portboard\n\nUsage:\n  portboard status [--json] [--cwd PATH]\n  portboard ps [--json] [--cwd PATH]\n  portboard open [TARGET] [--cwd PATH]\n  portboard ensure TARGET --herdr [--wait] [--cwd PATH]\n  portboard url TARGET [ENDPOINT] [--open] [--cwd PATH]\n  portboard open-url [URL]\n  portboard logs TARGET [--lines N] [--follow] [--cwd PATH]\n  portboard stop TARGET [--cwd PATH]\n  portboard serve [--cwd PATH] [--bind ADDRESS]\n  portboard panel\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn json_array_retains_inspection_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::launch_target_config::parse_launch_target_config(
+            "version = 1\n[[launch_targets]]\nid = 'x'\nlabel = 'X'\nargv = ['not-running']",
+        )
+        .unwrap();
+        let mut inspection =
+            crate::current_workspace_status::inspect_worktree_launch_targets(dir.path(), &config)
+                .unwrap();
+        inspection.findings.push("overlapping signatures".into());
+        let json = super::status_json(&inspection).unwrap();
+        assert!(json.is_array());
+        assert_eq!(json[0]["id"], "x");
+        assert_eq!(json[0]["findings"][0], "overlapping signatures");
+    }
 }

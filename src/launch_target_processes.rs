@@ -10,7 +10,14 @@ use crate::launch_target_config::LaunchTarget;
 /// Live operating-system process matching one launch target in its worktree.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LaunchTargetProcess {
+    /// Exact signature-matching descendants captured with this run's root.
+    /// Kept separately so metadata can name the coordinator without changing
+    /// duplicate counting or the root used for process-tree shutdown.
+    #[serde(skip)]
+    pub metadata_members: Vec<crate::process_identity::ProcessIdentity>,
     pub pid: u32,
+    #[serde(skip)]
+    pub start_time: u64,
     pub argv: Vec<String>,
 }
 
@@ -18,6 +25,8 @@ pub struct LaunchTargetProcess {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorktreeProcess {
     pub pid: u32,
+    #[serde(skip)]
+    pub start_time: u64,
     pub argv: Vec<String>,
 }
 
@@ -31,58 +40,197 @@ pub fn find_launch_target_processes(
     worktree_root: &Path,
     target: &LaunchTarget,
 ) -> Result<Vec<LaunchTargetProcess>> {
-    let process_match = if target.process_match.is_empty() {
-        &target.argv
-    } else {
-        &target.process_match
-    };
-    let processes = find_worktree_processes(worktree_root)?;
-    let argv_matches = processes
-        .iter()
-        .filter(|process| {
-            process_match.iter().all(|expected| {
-                process
-                    .argv
-                    .iter()
-                    .any(|argument| process_argument_matches(argument, expected))
-            })
-        })
-        .map(as_launch_target_process)
-        .collect::<Vec<_>>();
+    Ok(DiscoverySnapshot::capture(worktree_root)?.target_processes(target))
+}
 
-    // The configured signature is the authoritative instance boundary. Every
-    // descendant of a Portboard-hosted command inherits PORTBOARD_TARGET_ID,
-    // so mixing identity matches into a successful signature scan would count
-    // one process tree as many duplicate instances.
-    if !argv_matches.is_empty() {
-        return Ok(argv_matches);
+/// One refresh's proc/git inventory. Reuse across target status and inventory;
+/// signals always revalidate the captured identities independently.
+pub struct DiscoverySnapshot {
+    pub processes: Vec<WorktreeProcess>,
+    parents: std::collections::HashMap<u32, u32>,
+    target_ids: std::collections::HashMap<u32, String>,
+    endpoints: std::sync::OnceLock<
+        std::collections::HashMap<u32, Vec<crate::process_endpoints::ProcessEndpoint>>,
+    >,
+}
+
+impl DiscoverySnapshot {
+    pub fn capture(worktree_root: &Path) -> Result<Self> {
+        let processes = find_worktree_processes(worktree_root)?;
+        let mut parents = std::collections::HashMap::new();
+        let mut target_ids = std::collections::HashMap::new();
+        for process in &processes {
+            let mut current = process.pid;
+            while current > 1 && !parents.contains_key(&current) {
+                let Some(parent) =
+                    read_process_parent_pid(&PathBuf::from(format!("/proc/{current}")))
+                else {
+                    break;
+                };
+                parents.insert(current, parent);
+                current = parent;
+            }
+            if let Ok(environment) = fs::read(format!("/proc/{}/environ", process.pid)) {
+                if let Some(id) = environment
+                    .split(|byte| *byte == 0)
+                    .find_map(|entry| entry.strip_prefix(b"PORTBOARD_TARGET_ID="))
+                {
+                    target_ids.insert(process.pid, String::from_utf8_lossy(id).into_owned());
+                }
+            }
+        }
+        Ok(Self {
+            processes,
+            parents,
+            target_ids,
+            endpoints: std::sync::OnceLock::new(),
+        })
     }
 
-    // Identity is only a fallback for a target whose coordinator re-execed and
-    // no longer exposes its configured argv. Keep only the top-most matching
-    // process in each identity-bearing tree so descendants remain one run.
-    let identity_matches = processes
-        .iter()
-        .filter(|process| {
-            !looks_like_interactive_shell(&process.argv)
-                && process_has_portboard_target_identity(
-                    &as_launch_target_process(process),
-                    target.id.as_str(),
-                )
-        })
-        .collect::<Vec<_>>();
-    let identity_pids = identity_matches
-        .iter()
-        .map(|process| process.pid)
-        .collect::<std::collections::HashSet<_>>();
-    Ok(identity_matches
-        .into_iter()
-        .filter(|process| {
-            read_process_parent_pid(&PathBuf::from(format!("/proc/{}", process.pid)))
-                .is_none_or(|parent_pid| !identity_pids.contains(&parent_pid))
-        })
-        .map(as_launch_target_process)
-        .collect())
+    /// Lazily performs one grouped socket/parent scan for the whole refresh.
+    pub fn endpoints_by_process(
+        &self,
+    ) -> Result<&std::collections::HashMap<u32, Vec<crate::process_endpoints::ProcessEndpoint>>>
+    {
+        if self.endpoints.get().is_none() {
+            let processes = self
+                .processes
+                .iter()
+                .map(as_launch_target_process)
+                .collect::<Vec<_>>();
+            let grouped = crate::process_endpoints::find_process_endpoints_by_process(&processes)?;
+            let _ = self.endpoints.set(grouped);
+        }
+        Ok(self.endpoints.get().expect("initialized endpoint snapshot"))
+    }
+
+    pub fn target_endpoints(
+        &self,
+        processes: &[LaunchTargetProcess],
+    ) -> Result<Vec<crate::process_endpoints::ProcessEndpoint>> {
+        let roots = processes
+            .iter()
+            .map(|p| p.pid)
+            .collect::<std::collections::HashSet<_>>();
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut endpoints = Vec::new();
+        for (pid, owned) in self.endpoints_by_process()? {
+            let mut current = *pid;
+            let mut visited = std::collections::HashSet::new();
+            loop {
+                if roots.contains(&current) {
+                    endpoints.extend(owned.iter().cloned());
+                    break;
+                }
+                if !visited.insert(current) {
+                    break;
+                }
+                let Some(parent) = self.parents.get(&current) else {
+                    break;
+                };
+                current = *parent;
+            }
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        Ok(endpoints)
+    }
+
+    pub fn target_processes(&self, target: &LaunchTarget) -> Vec<LaunchTargetProcess> {
+        let signature = if target.process_match.is_empty() {
+            &target.argv
+        } else {
+            &target.process_match
+        };
+        let candidates = self
+            .processes
+            .iter()
+            .filter(|process| {
+                signature.iter().all(|expected| {
+                    process
+                        .argv
+                        .iter()
+                        .any(|arg| process_argument_matches(arg, expected))
+                }) || (!looks_like_interactive_shell(&process.argv)
+                    && self
+                        .target_ids
+                        .get(&process.pid)
+                        .is_some_and(|id| id == target.id.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let pids = candidates
+            .iter()
+            .map(|process| process.pid)
+            .collect::<std::collections::HashSet<_>>();
+        candidates
+            .iter()
+            .copied()
+            .filter(|process| {
+                let mut current = process.pid;
+                let mut visited = std::collections::HashSet::new();
+                while let Some(parent) = self.parents.get(&current) {
+                    if !visited.insert(*parent) {
+                        break;
+                    }
+                    if pids.contains(parent) {
+                        return false;
+                    }
+                    current = *parent;
+                }
+                crate::process_identity::ProcessIdentity {
+                    pid: process.pid,
+                    start_time: process.start_time,
+                }
+                .is_live()
+            })
+            .map(|root| {
+                let mut process = as_launch_target_process(root);
+                process.metadata_members = candidates
+                    .iter()
+                    .filter(|member| {
+                        member.pid != root.pid
+                            && signature.iter().all(|expected| {
+                                member
+                                    .argv
+                                    .iter()
+                                    .any(|arg| process_argument_matches(arg, expected))
+                            })
+                            && {
+                                let mut current = member.pid;
+                                let mut visited = std::collections::HashSet::new();
+                                while visited.insert(current) {
+                                    let Some(parent) = self.parents.get(&current) else {
+                                        return false;
+                                    };
+                                    if *parent == root.pid {
+                                        return true;
+                                    }
+                                    current = *parent;
+                                }
+                                false
+                            }
+                    })
+                    .map(|member| crate::process_identity::ProcessIdentity {
+                        pid: member.pid,
+                        start_time: member.start_time,
+                    })
+                    .filter(|identity| identity.is_live())
+                    .collect();
+                process
+            })
+            .collect()
+    }
+}
+
+impl LaunchTargetProcess {
+    pub fn identity(&self) -> crate::process_identity::ProcessIdentity {
+        crate::process_identity::ProcessIdentity {
+            pid: self.pid,
+            start_time: self.start_time,
+        }
+    }
 }
 
 /// Shell basenames whose bare invocation identifies an interactive shell.
@@ -174,7 +322,11 @@ pub fn find_worktree_processes(worktree_root: &Path) -> Result<Vec<WorktreeProce
         if read_process_start_time(&process_path) != Some(start_time) {
             continue;
         }
-        matches.push(WorktreeProcess { pid, argv });
+        matches.push(WorktreeProcess {
+            pid,
+            start_time,
+            argv,
+        });
     }
 
     matches.sort_by_key(|process| process.pid);
@@ -186,6 +338,9 @@ pub fn process_has_portboard_target_identity(
     process: &LaunchTargetProcess,
     target_id: &str,
 ) -> bool {
+    if !process.identity().is_live() {
+        return false;
+    }
     let Ok(environment) = fs::read(format!("/proc/{}/environ", process.pid)) else {
         return false;
     };
@@ -219,7 +374,9 @@ fn sibling_git_worktrees(canonical_root: &Path) -> Vec<PathBuf> {
 
 fn as_launch_target_process(process: &WorktreeProcess) -> LaunchTargetProcess {
     LaunchTargetProcess {
+        metadata_members: Vec::new(),
         pid: process.pid,
+        start_time: process.start_time,
         argv: process.argv.clone(),
     }
 }
@@ -268,6 +425,126 @@ mod tests {
     use crate::launch_target_config::parse_launch_target_config;
 
     #[test]
+    fn snapshot_reuses_the_grouped_listener_scan() {
+        let identity = crate::process_identity::ProcessIdentity::read(std::process::id()).unwrap();
+        let snapshot = super::DiscoverySnapshot {
+            processes: vec![super::WorktreeProcess {
+                pid: identity.pid,
+                start_time: identity.start_time,
+                argv: vec!["listener".into()],
+            }],
+            parents: Default::default(),
+            target_ids: Default::default(),
+            endpoints: Default::default(),
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let initial = snapshot.endpoints_by_process().unwrap().clone();
+        drop(listener);
+        assert!(initial[&identity.pid]
+            .iter()
+            .any(|endpoint| endpoint.port == port));
+        assert_eq!(
+            snapshot.endpoints_by_process().unwrap(),
+            &initial,
+            "one refresh must not rescan listeners per target"
+        );
+        let roots = snapshot
+            .processes
+            .iter()
+            .map(super::as_launch_target_process)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot.target_endpoints(&roots).unwrap(),
+            initial[&identity.pid]
+        );
+    }
+
+    #[test]
+    fn refresh_snapshot_is_shared_by_status_and_inventory_without_rescanning() {
+        let root = tempfile::tempdir().unwrap();
+        let config = parse_launch_target_config(
+            r#"version = 1
+[[launch_targets]]
+id = "snapshot"
+label = "Snapshot"
+argv = ["snapshot-marker"]
+"#,
+        )
+        .unwrap();
+        let snapshot = super::DiscoverySnapshot::capture(root.path()).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("PORTBOARD_TARGET_ID", "snapshot")
+            .current_dir(root.path())
+            .spawn()
+            .unwrap();
+        let inspection =
+            crate::current_workspace_status::inspect_worktree_launch_targets_with_snapshot(
+                root.path(),
+                &config,
+                &snapshot,
+            )
+            .unwrap();
+        let inventory = crate::worktree_processes::inspect_worktree_processes_with_snapshot(
+            &config.launch_targets,
+            &snapshot,
+        )
+        .unwrap();
+        let next = super::DiscoverySnapshot::capture(root.path()).unwrap();
+        let found = next.target_processes(&config.launch_targets[0]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            inventory.is_empty(),
+            "inventory must reuse its refresh's capture"
+        );
+        assert!(matches!(
+            inspection.statuses[0].state,
+            crate::current_workspace_status::LaunchTargetRuntimeState::Stopped
+        ));
+        assert_eq!(found.len(), 1);
+        assert!(
+            next.target_processes(&config.launch_targets[0]).is_empty(),
+            "cached identities must still be revalidated"
+        );
+    }
+
+    #[test]
+    fn independent_identity_tree_is_not_hidden_by_signature() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = parse_launch_target_config(
+            r#"version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["missing"]
+process_match = ["signature-probe"]
+"#,
+        )
+        .unwrap();
+        let mut manual = Command::new("bash")
+            .args(["-c", "exec -a signature-probe sleep 30"])
+            .current_dir(temporary.path())
+            .spawn()
+            .unwrap();
+        let mut owned = Command::new("sleep")
+            .arg("30")
+            .env("PORTBOARD_TARGET_ID", "probe")
+            .current_dir(temporary.path())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let found =
+            find_launch_target_processes(temporary.path(), &config.launch_targets[0]).unwrap();
+        manual.kill().unwrap();
+        manual.wait().unwrap();
+        owned.kill().unwrap();
+        owned.wait().unwrap();
+        assert_eq!(found.len(), 2, "independent runs must remain visible");
+    }
+
+    #[test]
     fn does_not_report_the_scanner_as_a_target_process() {
         let worktree = std::env::current_dir().expect("current worktree");
         let executable = std::env::current_exe().expect("test executable");
@@ -300,7 +577,11 @@ process_match = ["{executable_name}"]
     fn uses_the_signature_as_the_instance_boundary_for_a_process_tree() {
         let temporary = tempfile::tempdir().expect("temporary worktree");
         let script = temporary.path().join("instance-marker.sh");
-        fs::write(&script, "#!/bin/sh\nsleep 30 &\nwait\n").expect("target script");
+        fs::write(
+            &script,
+            "#!/bin/sh\nsleep 30 &\nchild=$!\ntrap 'kill $child; wait $child; exit' TERM\nwait\n",
+        )
+        .expect("target script");
         let config = parse_launch_target_config(
             r#"
 version = 1
@@ -326,7 +607,9 @@ process_match = ["instance-marker.sh"]
         let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
             .expect("process scan");
 
-        child.kill().expect("stop process tree");
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
         child.wait().expect("reap process tree");
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, child.id());
@@ -394,6 +677,7 @@ process_match = ["never-matches-anything"]
         let processes = find_launch_target_processes(temporary.path(), &config.launch_targets[0])
             .expect("process scan");
         child.kill().expect("kill identity test process");
+        child.wait().expect("reap identity test process");
 
         assert!(processes.iter().any(|process| process.pid == child.id()));
     }

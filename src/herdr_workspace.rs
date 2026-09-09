@@ -263,6 +263,29 @@ pub fn reap_stale_launch_target_tabs(
     Ok(closed_tabs)
 }
 
+/// Close only the selected tab, and only after every split is idle and owned.
+/// Missing/failed pane inspection is unsafe and preserves the tab.
+pub fn close_idle_launch_target_tab(
+    workspace_id: &str,
+    tab_id: &str,
+    target: &LaunchTarget,
+) -> Result<bool> {
+    let panes: HerdrResponse<HerdrPaneListResult> =
+        run_herdr_json(&["pane", "list", "--workspace", workspace_id])?;
+    let liveness = panes
+        .result
+        .panes
+        .iter()
+        .filter(|pane| pane.tab_id == tab_id)
+        .map(|pane| pane_liveness(&pane.pane_id, target.id.as_str()))
+        .collect::<Vec<_>>();
+    if !tab_is_reapable(&liveness) {
+        return Ok(false);
+    }
+    close_launch_target_herdr_tab(tab_id)?;
+    Ok(true)
+}
+
 struct LaunchTargetPaneLiveness {
     portboard_owned: bool,
     has_foreground_command: bool,
@@ -284,7 +307,10 @@ fn pane_liveness(pane_id: &str, target_id: &str) -> LaunchTargetPaneLiveness {
     let process_info = response.result.process_info;
     let portboard_owned = process_has_portboard_target_identity(
         &crate::launch_target_processes::LaunchTargetProcess {
+            metadata_members: Vec::new(),
             pid: process_info.shell_pid,
+            start_time: crate::process_identity::ProcessIdentity::read(process_info.shell_pid)
+                .map_or(0, |id| id.start_time),
             argv: Vec::new(),
         },
         target_id,

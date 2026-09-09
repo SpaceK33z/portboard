@@ -473,3 +473,193 @@ process_match = ["probe"]
         .expect("UTF-8 logs error")
         .contains("is not running"));
 }
+
+#[test]
+fn open_url_rejects_raw_terminal_controls_without_echoing_them() {
+    for control in ["\x07\x1b]52;c;AAAA\x07", "\t", "\n", "\r"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_portboard"))
+            .args(["open-url", &format!("http://localhost:3000/{control}")])
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.contains(&7) && !output.stderr.contains(&27));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("control characters"));
+    }
+}
+
+#[test]
+fn empty_arguments_default_to_status() {
+    let repository = initialize_repository("version = 1\nlaunch_targets = []\n");
+    let output = Command::new(env!("CARGO_BIN_EXE_portboard"))
+        .current_dir(repository.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Portboard"));
+}
+
+#[test]
+fn dashboard_tail_preserves_partial_lines_and_binary_bytes() {
+    let repository = initialize_repository(
+        r#"version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["never-running-audit"]
+"#,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let runs = state_runs_directory(state.path(), &repository.path().canonicalize().unwrap());
+    fs::create_dir_all(&runs).unwrap();
+    fs::write(runs.join("probe.1.log"), b"discard\nkeep\npartial\xff").unwrap();
+    let output = Command::new("timeout")
+        .args(["5s", env!("CARGO_BIN_EXE_portboard")])
+        .args(["logs", "probe", "--lines", "2", "--cwd"])
+        .arg(repository.path())
+        .env("PORTBOARD_STATE_DIR", state.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        output.stdout.ends_with(b"keep\npartial\xff"),
+        "{:?}",
+        output.stdout
+    );
+    assert!(!output.stdout.windows(7).any(|w| w == b"discard"));
+}
+
+#[test]
+fn dashboard_follow_streams_append_truncate_and_replacement_exactly() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    struct Reader(std::process::Child);
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn wait_for(path: &std::path::Path, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let bytes = fs::read(path).unwrap();
+            if bytes.ends_with(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected:?}, got {bytes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let repository = initialize_repository(
+        r#"version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["never-running-audit-follow"]
+"#,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let runs = state_runs_directory(state.path(), &repository.path().canonicalize().unwrap());
+    fs::create_dir_all(&runs).unwrap();
+    let path = runs.join("probe.log");
+    fs::write(&path, b"discard\ninitial\n").unwrap();
+    let output_path = state.path().join("output");
+    let output = fs::File::create(&output_path).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_portboard"));
+    command
+        .args(["logs", "probe", "--lines", "1", "--follow", "--cwd"])
+        .arg(repository.path())
+        .env_remove("HERDR_WORKSPACE_ID")
+        .env_remove("PORTBOARD_WORKSPACE_ID")
+        .env("PORTBOARD_STATE_DIR", state.path())
+        .stdout(output)
+        .stderr(Stdio::null());
+    let _reader = Reader(command.spawn().unwrap());
+    wait_for(&output_path, b"initial\n");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"append\xff")
+        .unwrap();
+    wait_for(&output_path, b"initial\nappend\xff");
+    fs::write(&path, b"t\n").unwrap();
+    wait_for(&output_path, b"initial\nappend\xfft\n");
+    fs::rename(&path, runs.join("old.log")).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    fs::write(&path, b"replacement-longer-than-old\n").unwrap();
+    wait_for(
+        &output_path,
+        b"initial\nappend\xfft\nreplacement-longer-than-old\n",
+    );
+    for _ in 0..100 {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"z")
+            .unwrap();
+    }
+    let mut expected = b"initial\nappend\xfft\nreplacement-longer-than-old\n".to_vec();
+    expected.extend_from_slice(&[b'z'; 100]);
+    wait_for(&output_path, &expected);
+    let bytes = fs::read(&output_path).unwrap();
+    let first_newline = bytes.iter().position(|&b| b == b'\n').unwrap();
+    assert_eq!(&bytes[first_newline + 1..], expected);
+}
+
+#[test]
+fn dashboard_tail_large_sparse_file_uses_bounded_memory() {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::process::CommandExt;
+    let repository = initialize_repository(
+        r#"version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["never-running-sparse-audit"]
+"#,
+    );
+    let state = tempfile::tempdir().unwrap();
+    let runs = state_runs_directory(state.path(), &repository.path().canonicalize().unwrap());
+    fs::create_dir_all(&runs).unwrap();
+    let mut file = fs::File::create(runs.join("probe.1.log")).unwrap();
+    file.seek(SeekFrom::Start(256 * 1024 * 1024)).unwrap();
+    file.write_all(b"\nlast line\n").unwrap();
+    let mut command = Command::new("timeout");
+    command.args(["5s", env!("CARGO_BIN_EXE_portboard")]);
+    command
+        .args(["logs", "probe", "--lines", "1", "--cwd"])
+        .arg(repository.path())
+        .env("PORTBOARD_STATE_DIR", state.path());
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 128 * 1024 * 1024,
+                rlim_max: 128 * 1024 * 1024,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"last line\n"));
+    assert!(output.stdout.len() < 1024);
+}

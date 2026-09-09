@@ -46,14 +46,17 @@ use ratatui::{Frame, Terminal};
 
 use crate::browser_url::{browser_url, copy_url_to_clipboard, open_browser_url, UrlOpenOutcome};
 use crate::current_workspace_status::{
-    inspect_worktree_launch_targets, CurrentLaunchTargetStatus, LaunchTargetRuntimeState,
-    WorktreeLaunchTargetInspection,
+    inspect_worktree_launch_targets_with_snapshot, CurrentLaunchTargetStatus,
+    LaunchTargetRuntimeState, WorktreeLaunchTargetInspection,
 };
 use crate::herdr_workspace::current_herdr_workspace_id;
 use crate::launch_target_config::load_worktree_launch_targets;
 use crate::launch_target_open::open_or_start_launch_target;
+use crate::launch_target_processes::DiscoverySnapshot;
 use crate::launch_target_stop::{stop_launch_target, stop_launch_target_and_close_herdr_tab};
-use crate::worktree_processes::{inspect_worktree_processes, WorktreeProcessInventoryEntry};
+use crate::worktree_processes::{
+    inspect_worktree_processes_with_snapshot, WorktreeProcessInventoryEntry,
+};
 
 /// How often the panel re-inspects targets so running/stopped status stays live.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -144,6 +147,7 @@ struct PanelApp {
     message: Option<String>,
     last_refresh: Instant,
     stop_rx: Option<Receiver<Result<Vec<u32>>>>,
+    open_url: fn(&str) -> String,
 }
 
 impl PanelApp {
@@ -169,6 +173,7 @@ impl PanelApp {
             message: None,
             last_refresh: Instant::now(),
             stop_rx: None,
+            open_url: open_message,
         })
     }
 
@@ -183,12 +188,23 @@ impl PanelApp {
     fn refresh(&mut self) {
         self.last_refresh = Instant::now();
         self.load_error = None;
+        let snapshot = match DiscoverySnapshot::capture(&self.worktree_root) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.load_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
         let mut targets = Vec::new();
         if self.has_manifest() {
             match load_worktree_launch_targets(&self.worktree_root) {
                 Ok(config) => {
                     targets = config.launch_targets.clone();
-                    match inspect_worktree_launch_targets(&self.worktree_root, &config) {
+                    match inspect_worktree_launch_targets_with_snapshot(
+                        &self.worktree_root,
+                        &config,
+                        &snapshot,
+                    ) {
                         Ok(inspection) => self.inspection = Some(inspection),
                         Err(error) => self.load_error = Some(format!("{error:#}")),
                     }
@@ -201,7 +217,7 @@ impl PanelApp {
         } else {
             self.inspection = None;
         }
-        match inspect_worktree_processes(&self.worktree_root, &targets) {
+        match inspect_worktree_processes_with_snapshot(&targets, &snapshot) {
             Ok(inventory) => self.inventory = Some(inventory),
             Err(_) => {
                 self.inventory = None;
@@ -236,15 +252,11 @@ impl PanelApp {
         let mut rows = Vec::new();
         for entry in inventory {
             for endpoint in &entry.endpoints {
-                let host = match endpoint.address.as_str() {
-                    "0.0.0.0" | "127.0.0.1" => "localhost".to_string(),
-                    "::" | "::1" => "[::1]".to_string(),
-                    other if other.contains(':') => format!("[{other}]"),
-                    other => other.to_string(),
-                };
+                let url =
+                    crate::browser_url::listener_browser_url(&endpoint.address, endpoint.port);
                 rows.push(PortRow {
                     label: format!(":{}", endpoint.port),
-                    url: format!("http://{host}:{}", endpoint.port),
+                    url,
                     pid: entry.pid,
                     target: entry.target_ids.first().cloned(),
                     port: endpoint.port,
@@ -260,7 +272,14 @@ impl PanelApp {
         self.inspection
             .as_ref()
             .map(|inspection| inspection.statuses.len())
-            .unwrap_or(0)
+            .filter(|count| *count > 0)
+            .unwrap_or_else(|| self.inventory.as_ref().map_or(0, Vec::len))
+    }
+
+    fn has_targets(&self) -> bool {
+        self.inspection
+            .as_ref()
+            .is_some_and(|i| !i.statuses.is_empty())
     }
 
     fn selected_status(&self) -> Option<&CurrentLaunchTargetStatus> {
@@ -289,7 +308,7 @@ impl PanelApp {
                 };
                 rows.push(EndpointRow {
                     label: format!("tcp {address}:{}", endpoint.port),
-                    url: format!("http://{address}:{}", endpoint.port),
+                    url: crate::browser_url::listener_browser_url(&endpoint.address, endpoint.port),
                 });
             }
         }
@@ -332,13 +351,11 @@ impl PanelApp {
                             Focus::Targets => return Ok(Some(true)),
                         };
                     }
-                    KeyCode::Enter => {
-                        if self.focus == Focus::Endpoints {
-                            self.open_endpoint(self.selected_endpoint);
-                        } else {
-                            return self.open_or_start();
-                        }
-                    }
+                    KeyCode::Enter => match self.focus {
+                        Focus::Endpoints => self.open_endpoint(self.selected_endpoint),
+                        Focus::Ports => self.open_port(self.selected_port),
+                        Focus::Targets => return self.open_or_start(),
+                    },
                     KeyCode::Char('o') => match self.focus {
                         Focus::Endpoints => self.open_endpoint(self.selected_endpoint),
                         Focus::Ports => self.open_port(self.selected_port),
@@ -372,7 +389,8 @@ impl PanelApp {
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Targets => Focus::Ports,
-            Focus::Ports => Focus::Endpoints,
+            Focus::Ports if self.has_targets() => Focus::Endpoints,
+            Focus::Ports => Focus::Targets,
             Focus::Endpoints => Focus::Targets,
         };
     }
@@ -424,13 +442,13 @@ impl PanelApp {
 
     fn open_endpoint(&mut self, index: usize) {
         if let Some(row) = self.endpoint_rows().get(index) {
-            self.message = Some(open_message(row.url.as_str()));
+            self.message = Some((self.open_url)(row.url.as_str()));
         }
     }
 
     fn open_port(&mut self, index: usize) {
         if let Some(row) = self.port_rows().get(index) {
-            self.message = Some(open_message(row.url.as_str()));
+            self.message = Some((self.open_url)(row.url.as_str()));
         }
     }
 
@@ -439,7 +457,7 @@ impl PanelApp {
             return;
         };
         match browser_url(status) {
-            Some(url) => self.message = Some(open_message(url.as_str())),
+            Some(url) => self.message = Some((self.open_url)(url.as_str())),
             None => self.message = Some("no endpoint URL to open".to_string()),
         }
     }
@@ -526,26 +544,45 @@ impl PanelApp {
         let (width, height) =
             crossterm::terminal::size().context("Portboard panel could not read terminal size")?;
         let area = Rect::new(0, 0, width, height);
+        self.handle_mouse_in(mouse, area)
+    }
+
+    fn handle_mouse_in(&mut self, mouse: MouseEvent, area: Rect) -> Result<Option<bool>> {
         let areas = layout_areas(area);
         let point = (mouse.column, mouse.row);
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+        ) {
+            if rect_contains(areas.targets, point) {
+                self.focus = Focus::Targets;
+            } else if rect_contains(areas.ports, point) {
+                self.focus = Focus::Ports;
+            } else if rect_contains(areas.endpoints, point) && self.has_targets() {
+                self.focus = Focus::Endpoints;
+            }
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if rect_contains(areas.targets, point) {
-                    let index = mouse.row.saturating_sub(areas.targets.y) as usize;
+                    let index = mouse.row.saturating_sub(areas.targets.y) as usize
+                        + self.target_list_state.offset();
                     if index < self.target_count() {
                         self.selected_target = index;
                         self.selected_endpoint = 0;
                         self.focus = Focus::Targets;
                     }
                 } else if rect_contains(areas.ports, point) {
-                    let index = mouse.row.saturating_sub(areas.ports.y) as usize;
+                    let index = mouse.row.saturating_sub(areas.ports.y) as usize
+                        + self.port_list_state.offset();
                     if index < self.port_rows().len() {
                         self.selected_port = index;
                         self.focus = Focus::Ports;
                         self.open_port(index);
                     }
                 } else if rect_contains(areas.endpoints, point) {
-                    let index = mouse.row.saturating_sub(areas.endpoints.y) as usize;
+                    let index = mouse.row.saturating_sub(areas.endpoints.y) as usize
+                        + self.endpoint_list_state.offset();
                     if index < self.endpoint_rows().len() {
                         self.selected_endpoint = index;
                         self.focus = Focus::Endpoints;
@@ -583,39 +620,22 @@ impl PanelApp {
             areas.header,
         );
 
-        if !self.has_manifest() {
-            self.render_no_manifest(frame, &areas);
-        } else {
-            self.render_manifest(frame, &areas);
-        }
+        self.render_manifest(frame, &areas);
 
         frame.render_widget(self.footer(), areas.footer);
     }
 
     fn render_manifest(&mut self, frame: &mut Frame, areas: &Areas) {
-        if self.target_count() == 0 {
-            let text = self
-                .load_error
-                .as_deref()
-                .unwrap_or("portboard.toml is present but declares no launch targets");
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    text,
-                    Style::default().fg(Color::Yellow),
-                )))
-                .block(Block::new().borders(Borders::ALL).title(" portboard "))
-                .wrap(Wrap { trim: false }),
-                areas.body,
-            );
-            return;
-        }
-
         let targets = List::new(self.target_items())
             .block(
                 Block::new()
                     .borders(Borders::ALL)
                     .title(Span::styled(
-                        " targets ",
+                        if self.has_targets() {
+                            " targets "
+                        } else {
+                            " processes "
+                        },
                         self.pane_title_style(Focus::Targets),
                     ))
                     .border_style(self.pane_border_style(Focus::Targets)),
@@ -676,7 +696,7 @@ impl PanelApp {
         );
     }
 
-    fn render_no_manifest(&mut self, frame: &mut Frame, areas: &Areas) {
+    fn inventory_items(&self) -> Vec<ListItem<'static>> {
         let inventory = self.inventory.clone().unwrap_or_default();
         let mut items = Vec::new();
         if inventory.is_empty() {
@@ -709,19 +729,14 @@ impl PanelApp {
                 ])));
             }
         }
-        let title = format!(
-            " {} processes running · no portboard.toml in {} ",
-            inventory.len(),
-            self.worktree_root.display()
-        );
-        let list = List::new(items).block(Block::new().borders(Borders::ALL).title(title));
-        frame.render_widget(list, areas.body);
+        items
     }
 
     fn target_items(&self) -> Vec<ListItem<'static>> {
-        let Some(inspection) = &self.inspection else {
-            return Vec::new();
-        };
+        if !self.has_targets() {
+            return self.inventory_items();
+        }
+        let inspection = self.inspection.as_ref().expect("targets inspection");
         inspection
             .statuses
             .iter()
@@ -746,6 +761,14 @@ impl PanelApp {
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(pad(&status.label, 24)),
+                    Span::styled(
+                        if status.metadata_error.is_some() {
+                            "warning! "
+                        } else {
+                            ""
+                        },
+                        Style::default().fg(Color::Yellow),
+                    ),
                     Span::styled(word, Style::default().fg(color)),
                     Span::styled(pid_text, Style::default().fg(Color::DarkGray)),
                 ]))
@@ -793,6 +816,12 @@ impl PanelApp {
         let mut lines = Vec::new();
         match status {
             Some(status) => {
+                if let Some(error) = &status.metadata_error {
+                    lines.push(Line::from(Span::styled(
+                        error.clone(),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
                 match &status.state {
                     LaunchTargetRuntimeState::Stopped => lines.push(Line::from(vec![
                         Span::styled("state", Style::default().fg(Color::DarkGray)),
@@ -835,6 +864,10 @@ impl PanelApp {
                         error.clone(),
                         Style::default().fg(Color::Red),
                     )));
+                } else {
+                    lines.push(Line::from(
+                        "No launch targets; configure portboard.toml to manage runs.",
+                    ));
                 }
             }
         }
@@ -892,16 +925,33 @@ impl PanelApp {
                 Style::default().fg(Color::Cyan),
             )));
         }
-        if let Some(inspection) = &self.inspection {
-            for finding in &inspection.findings {
-                lines.push(Line::from(Span::styled(
-                    format!(" warning: {finding}"),
+        let warnings = self
+            .inspection
+            .as_ref()
+            .map(|i| i.findings.join("; "))
+            .unwrap_or_default();
+        if !warnings.is_empty() || self.load_error.is_some() {
+            lines.insert(
+                0,
+                Line::from(Span::styled(
+                    format!(
+                        " warning: {}{}",
+                        self.load_error.as_deref().unwrap_or(""),
+                        warnings
+                    ),
                     Style::default().fg(Color::Yellow),
-                )));
-            }
+                )),
+            );
         }
         lines.push(Line::from(Span::styled(
-            format!(" focus {} · ", self.focus.name()),
+            format!(
+                " focus {} · ",
+                if self.focus == Focus::Targets && !self.has_targets() {
+                    "processes"
+                } else {
+                    self.focus.name()
+                }
+            ),
             Style::default().fg(Color::Cyan),
         )));
         lines.push(Line::from(Span::styled(
@@ -948,7 +998,6 @@ fn truncate(value: &str, width: usize) -> String {
 
 struct Areas {
     header: Rect,
-    body: Rect,
     footer: Rect,
     targets_block: Rect,
     targets: Rect,
@@ -998,7 +1047,6 @@ fn layout_areas(area: Rect) -> Areas {
 
     Areas {
         header,
-        body,
         footer,
         targets_block,
         targets,
@@ -1024,4 +1072,147 @@ fn rect_contains(rect: Rect, (x, y): (u16, u16)) -> bool {
         && x < rect.x.saturating_add(rect.width)
         && y >= rect.y
         && y < rect.y.saturating_add(rect.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process_endpoints::ProcessEndpoint;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    fn app(root: &Path) -> PanelApp {
+        let mut app = PanelApp::new(root).unwrap();
+        app.open_url = |url| format!("opened {url}");
+        app.inventory = Some(
+            (0..40)
+                .map(|i| WorktreeProcessInventoryEntry {
+                    pid: 100 + i,
+                    argv: vec![format!("process-{i}")],
+                    target_ids: vec![],
+                    endpoints: vec![ProcessEndpoint {
+                        protocol: "tcp",
+                        address: "0.0.0.0".into(),
+                        port: 8000 + i as u16,
+                    }],
+                })
+                .collect(),
+        );
+        app
+    }
+    #[test]
+    fn inventory_and_ports_remain_visible_and_scrollable() {
+        for manifest in [
+            None,
+            Some("version = 1\nlaunch_targets = []"),
+            Some("invalid"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(text) = manifest {
+                std::fs::write(dir.path().join("portboard.toml"), text).unwrap();
+            }
+            let mut app = app(dir.path());
+            app.move_selection(30);
+            assert_eq!(app.selected_target, 30);
+            let backend = ratatui::backend::TestBackend::new(120, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| app.render(f)).unwrap();
+            let text = format!("{:?}", terminal.backend().buffer());
+            assert!(text.contains("ports (40)"), "{text}");
+            assert!(text.contains("process-30"), "{text}");
+            assert!(app.target_list_state.offset() > 0);
+        }
+    }
+    #[test]
+    fn enter_on_ports_opens_selected_url_not_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.focus = Focus::Ports;
+        app.selected_port = 3;
+        // No browser or Herdr operation is allowed in this test.
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("http://127.0.0.1:8003"));
+    }
+    #[test]
+    fn mouse_indices_include_each_list_scroll_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        let config = crate::launch_target_config::parse_launch_target_config(
+            "version = 1\n[[launch_targets]]\nid = 'x'\nlabel = 'X'\nargv = ['not-running']",
+        )
+        .unwrap();
+        app.inspection = Some(
+            inspect_worktree_launch_targets_with_snapshot(
+                dir.path(),
+                &config,
+                &DiscoverySnapshot::capture(dir.path()).unwrap(),
+            )
+            .unwrap(),
+        );
+        app.inspection.as_mut().unwrap().statuses[0].endpoints = app
+            .inventory
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flat_map(|e| e.endpoints.clone())
+            .collect();
+        let area = Rect::new(0, 0, 120, 30);
+        let areas = layout_areas(area);
+        for (focus, rect) in [
+            (Focus::Ports, areas.ports),
+            (Focus::Endpoints, areas.endpoints),
+        ] {
+            *app.port_list_state.offset_mut() = 9;
+            *app.endpoint_list_state.offset_mut() = 9;
+            app.handle_mouse_in(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            )
+            .unwrap();
+            assert!(app.focus == focus);
+            assert!(app.message.as_deref().unwrap().contains(":8010"));
+        }
+        app.inspection = None;
+        *app.target_list_state.offset_mut() = 9;
+        app.handle_mouse_in(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: areas.targets.x,
+                row: areas.targets.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .unwrap();
+        assert_eq!(app.selected_target, 10);
+    }
+    #[test]
+    fn refresh_and_render_keep_invalid_manifest_warning_and_ports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("portboard.toml"), "invalid").unwrap();
+        let mut app = app(dir.path());
+        app.refresh();
+        assert!(app.load_error.is_some());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let text = format!("{:?}", terminal.backend().buffer());
+        assert!(text.contains("ports ("), "{text}");
+        assert!(text.contains("warning:"), "{text}");
+        assert!(text.contains("processes"), "{text}");
+        app.toggle_focus();
+        assert!(app.focus == Focus::Ports);
+        app.toggle_focus();
+        assert!(app.focus == Focus::Targets);
+    }
 }

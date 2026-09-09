@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::launch_target_config::{LaunchTargetId, PortboardConfig};
-use crate::launch_target_processes::{find_launch_target_processes, LaunchTargetProcess};
-use crate::process_endpoints::{find_process_endpoints, ProcessEndpoint};
+use crate::launch_target_processes::{DiscoverySnapshot, LaunchTargetProcess};
+use crate::process_endpoints::ProcessEndpoint;
 use crate::runtime_metadata::{load_launch_target_runtime_metadata, RuntimeEndpoint};
 
 /// Observed process state for one launch target in the current worktree.
@@ -24,6 +24,9 @@ pub struct CurrentLaunchTargetStatus {
     pub argv: Vec<String>,
     pub endpoints: Vec<ProcessEndpoint>,
     pub named_endpoints: Vec<RuntimeEndpoint>,
+    /// Target-local metadata failure, also included in inspection findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
     /// Whether more than one live process currently matches this target. A
     /// duplicate run is exactly what Portboard exists to prevent, so every
     /// presentation surfaces it instead of hiding it behind `running`.
@@ -46,16 +49,50 @@ pub fn inspect_worktree_launch_targets(
     worktree_root: &Path,
     config: &PortboardConfig,
 ) -> Result<WorktreeLaunchTargetInspection> {
+    let snapshot = DiscoverySnapshot::capture(worktree_root)?;
+    inspect_worktree_launch_targets_with_snapshot(worktree_root, config, &snapshot)
+}
+
+pub fn inspect_worktree_launch_targets_with_snapshot(
+    worktree_root: &Path,
+    config: &PortboardConfig,
+    snapshot: &DiscoverySnapshot,
+) -> Result<WorktreeLaunchTargetInspection> {
+    let mut findings = Vec::new();
     let statuses = config
         .launch_targets
         .iter()
         .map(|target| {
-            let processes = find_launch_target_processes(worktree_root, target)?;
-            let endpoints = find_process_endpoints(&processes)?;
+            let processes = snapshot.target_processes(target);
+            let endpoints = snapshot.target_endpoints(&processes)?;
+            let mut metadata_error = None;
             let named_endpoints =
-                load_launch_target_runtime_metadata(worktree_root, target, &processes)?
-                    .map(|metadata| metadata.endpoints)
-                    .unwrap_or_default();
+                match load_launch_target_runtime_metadata(worktree_root, target, &processes) {
+                    Ok(metadata) => metadata
+                        .map(|metadata| metadata.endpoints)
+                        .unwrap_or_default(),
+                    Err(error) => {
+                        // Findings are shown by every presentation. Escape controls in
+                        // filesystem/error strings before they reach a terminal.
+                        let detail = format!(
+                            "target `{}` runtime metadata: {error:#}",
+                            target.id.as_str()
+                        );
+                        let detail: String = detail
+                            .chars()
+                            .flat_map(|ch| {
+                                if ch.is_control() {
+                                    ch.escape_default().collect::<Vec<_>>()
+                                } else {
+                                    vec![ch]
+                                }
+                            })
+                            .collect();
+                        findings.push(detail.clone());
+                        metadata_error = Some(detail);
+                        Vec::new()
+                    }
+                };
             let state = if processes.is_empty() {
                 LaunchTargetRuntimeState::Stopped
             } else {
@@ -71,12 +108,13 @@ pub fn inspect_worktree_launch_targets(
                 argv: target.argv.clone(),
                 endpoints,
                 named_endpoints,
+                metadata_error,
                 duplicate,
                 state,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let findings = cross_target_findings(&statuses);
+    findings.extend(cross_target_findings(&statuses));
     Ok(WorktreeLaunchTargetInspection { statuses, findings })
 }
 
@@ -128,6 +166,45 @@ mod tests {
     use crate::launch_target_config::parse_launch_target_config;
 
     use super::{inspect_worktree_launch_targets, LaunchTargetRuntimeState};
+
+    #[test]
+    fn live_metadata_errors_do_not_hide_healthy_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = format!("portboard-metadata-isolation-{}", std::process::id());
+        let mut child = Command::new("bash")
+            .args(["-c", &format!("exec -a {marker} sleep 10")])
+            .current_dir(root.path())
+            .spawn()
+            .unwrap();
+        let config = parse_launch_target_config(&format!(
+            r#"version = 1
+[[launch_targets]]
+id = "broken"
+label = "Broken"
+argv = ["{marker}"]
+runtime_file = "runtime.json"
+[[launch_targets]]
+id = "healthy"
+label = "Healthy"
+argv = ["missing-healthy-test-command"]
+"#
+        ))
+        .unwrap();
+        std::fs::write(root.path().join("runtime.json"), "malformed").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let result = inspect_worktree_launch_targets(root.path(), &config);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let inspection = result.expect("per-target metadata errors must be isolated");
+        assert_eq!(inspection.statuses.len(), 2);
+        assert!(inspection
+            .findings
+            .iter()
+            .any(|f| f.contains("broken") && f.contains("metadata")));
+        assert!(serde_json::to_string(&inspection.statuses)
+            .unwrap()
+            .contains("metadata_error"));
+    }
 
     #[test]
     fn reports_stopped_launch_target_when_no_process_matches() {

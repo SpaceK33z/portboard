@@ -3,208 +3,182 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
-
-use crate::herdr_workspace::{close_launch_target_herdr_tab, launch_target_herdr_tab_id};
+use crate::herdr_workspace::{close_idle_launch_target_tab, launch_target_herdr_tab_id};
 use crate::launch_target_config::LaunchTarget;
 use crate::launch_target_lock::LaunchTargetLock;
 use crate::launch_target_processes::{
-    find_launch_target_processes, process_has_portboard_target_identity,
+    find_launch_target_processes, process_has_portboard_target_identity, LaunchTargetProcess,
 };
+use crate::process_identity::ProcessIdentity;
+use anyhow::{bail, Context, Result};
 
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long SIGTERM survivors get to exit before Portboard escalates to
-/// SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+const KILL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// How often the post-SIGTERM wait rechecks whether the processes exited.
-const KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Sends SIGTERM to every live process that currently matches a launch target.
-///
-/// Processes are discovered again immediately before signaling so a stale panel
-/// selection cannot stop an unrelated PID.
+/// Blocking, bounded stop. Hold the launch lock through confirmed shutdown and
+/// optional safe tab cleanup so open/ensure cannot race a partially stopped run.
 pub fn stop_launch_target_and_close_herdr_tab(
     worktree_root: &Path,
     target: &LaunchTarget,
     workspace_id: &str,
 ) -> Result<Vec<u32>> {
-    let processes = find_launch_target_processes(worktree_root, target)?;
-    let tab_candidate_processes = if processes.is_empty() {
-        let mut launch_lock = LaunchTargetLock::acquire(worktree_root, target)?;
-        launch_lock
-            .active_reservation_pid()?
-            .map(|pid| {
-                vec![crate::launch_target_processes::LaunchTargetProcess {
-                    pid,
-                    argv: Vec::new(),
-                }]
-            })
-            .unwrap_or_default()
-    } else {
-        processes.clone()
-    };
-    let owned_processes = tab_candidate_processes
+    stop_locked(worktree_root, target, Some(workspace_id), None)
+}
+
+pub fn stop_launch_target(worktree_root: &Path, target: &LaunchTarget) -> Result<Vec<u32>> {
+    stop_locked(worktree_root, target, None, None)
+}
+
+pub fn stop_launch_target_with_owned_group(
+    worktree_root: &Path,
+    target: &LaunchTarget,
+    group: &crate::process_identity::OwnedProcessGroup,
+) -> Result<Vec<u32>> {
+    stop_locked(worktree_root, target, None, Some(group))
+}
+
+fn stop_locked(
+    worktree_root: &Path,
+    target: &LaunchTarget,
+    workspace: Option<&str>,
+    group: Option<&crate::process_identity::OwnedProcessGroup>,
+) -> Result<Vec<u32>> {
+    let mut lock = LaunchTargetLock::acquire(worktree_root, target)?;
+    let mut processes = find_launch_target_processes(worktree_root, target)?;
+    let reservation = lock.active_reservation_identity()?;
+    if let Some(identity) = reservation {
+        if !processes
+            .iter()
+            .any(|process| process.identity() == identity)
+        {
+            processes.push(LaunchTargetProcess {
+                metadata_members: Vec::new(),
+                pid: identity.pid,
+                start_time: identity.start_time,
+                argv: Vec::new(),
+            });
+        }
+    }
+    let owned = processes
         .iter()
-        .filter(|process| process_has_portboard_target_identity(process, target.id.as_str()))
+        .filter(|p| {
+            Some(p.identity()) == reservation
+                || process_has_portboard_target_identity(p, target.id.as_str())
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let herdr_tab_id = if owned_processes.is_empty() {
-        None
-    } else {
-        launch_target_herdr_tab_id(workspace_id, &owned_processes)?
+    let tab = match workspace {
+        Some(workspace) if !owned.is_empty() => launch_target_herdr_tab_id(workspace, &owned)?,
+        _ => None,
     };
-    let stopped_pids = stop_launch_target(worktree_root, target)?;
-    if let Some(tab_id) = herdr_tab_id {
-        if !processes.is_empty() {
-            wait_for_launch_target_to_stop(worktree_root, target, STOP_TIMEOUT)?;
-        }
-        close_launch_target_herdr_tab(&tab_id)?;
+    let mut identities = processes
+        .iter()
+        .map(LaunchTargetProcess::identity)
+        .collect::<Vec<_>>();
+    if let Some(group) = group {
+        identities.extend(group.members()?);
     }
-    Ok(stopped_pids)
+    let identities = crate::process_identity::process_trees(&identities)?;
+    let pids = stop_process_identities(&identities)?;
+    if let Some(group) = group {
+        if !group.members()?.is_empty() {
+            bail!("Portboard owned process group still has live members after stop");
+        }
+    }
+    if !find_launch_target_processes(worktree_root, target)?.is_empty() {
+        bail!("Portboard launch target still has live processes after stop");
+    }
+    lock.clear()?;
+    if let (Some(workspace), Some(tab)) = (workspace, tab) {
+        close_idle_launch_target_tab(workspace, &tab, target)?;
+    }
+    Ok(pids)
 }
 
-/// Sends SIGTERM to each matching process without requiring a Herdr workspace.
-pub fn stop_launch_target(worktree_root: &Path, target: &LaunchTarget) -> Result<Vec<u32>> {
-    let processes = find_launch_target_processes(worktree_root, target)?;
-    if processes.is_empty() {
-        let mut launch_lock = LaunchTargetLock::acquire(worktree_root, target)?;
-        return Ok(launch_lock
-            .cancel_active_reservation()?
-            .into_iter()
-            .collect());
-    }
-
-    let mut signaled = Vec::with_capacity(processes.len());
-    for process in processes {
-        let pid = i32::try_from(process.pid)
-            .with_context(|| format!("Portboard cannot signal pid {}", process.pid))?;
-        let pidfd = PidFd::open(pid)?;
-
-        // Validate again after opening the pidfd. If the original process exited
-        // before pidfd_open and its numeric PID was reused, the descriptor now
-        // refers to that replacement; never signal it unless it still matches.
-        let still_matches = find_launch_target_processes(worktree_root, target)?
-            .iter()
-            .any(|candidate| candidate.pid == process.pid);
-        if !still_matches {
+/// Common stop seam for reservations, matching runs, and explicitly captured
+/// dashboard group members. Never signals a numeric process group. Call from a
+/// worker thread, not the dashboard accept loop; completion confirms exit.
+pub fn stop_process_identities(identities: &[ProcessIdentity]) -> Result<Vec<u32>> {
+    let mut signaled = Vec::new();
+    for identity in identities {
+        if !identity.is_live() {
             continue;
         }
-
-        let result = match &pidfd {
-            Some(pidfd) => pidfd.send_sigterm(),
-            None => {
-                // Old kernels without pidfds get the narrowest available
-                // fallback immediately after the second revalidation.
-                // SAFETY: libc::kill does not retain pointers and `pid` is a
-                // validated, positive process id obtained from /proc.
-                let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-                if result == 0 {
-                    Ok(())
-                } else {
-                    Err(io::Error::last_os_error())
-                }
-            }
+        let pid = i32::try_from(identity.pid).context("invalid process pid")?;
+        let pidfd = match PidFd::open(pid) {
+            Ok(fd) => fd,
+            Err(_) if !identity.is_live() => continue,
+            Err(error) => return Err(error),
         };
-        match result {
-            Ok(()) => signaled.push(SignaledProcess {
-                pid: process.pid,
-                pidfd,
-            }),
-            // A natural exit already satisfies the requested stop operation.
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Portboard could not stop pid {}", process.pid));
-            }
-        }
+        let process = SignaledProcess {
+            identity: *identity,
+            pidfd,
+        };
+        process.send(libc::SIGTERM)?;
+        signaled.push(process);
     }
-    wait_for_sigterm_exit(&signaled);
-    kill_survivors(&signaled)?;
-    Ok(signaled.iter().map(|process| process.pid).collect())
+    wait_for_exit(&signaled, KILL_GRACE);
+    for process in &signaled {
+        process.send(libc::SIGKILL)?;
+    }
+    wait_for_exit(&signaled, KILL_GRACE);
+    if signaled.iter().any(|process| process.identity.is_live()) {
+        bail!("Portboard could not confirm process exit after SIGKILL");
+    }
+    Ok(signaled
+        .iter()
+        .map(|process| process.identity.pid)
+        .collect())
 }
 
-/// One process that received SIGTERM together with its pidfd, when the kernel
-/// supports them, so escalation cannot hit a reused numeric PID.
 struct SignaledProcess {
-    pid: u32,
+    identity: ProcessIdentity,
     pidfd: Option<PidFd>,
 }
 
-/// Waits up to [`KILL_GRACE`] for every signaled process to exit on its own.
-fn wait_for_sigterm_exit(signaled: &[SignaledProcess]) {
-    let deadline = Instant::now() + KILL_GRACE;
-    loop {
-        if signaled.iter().all(|process| !process_exists(process.pid)) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(KILL_POLL_INTERVAL);
+/// Injected read/signal functions allow safe PID-reuse regression tests without
+/// ever signaling real unrelated processes.
+fn signal_if_current(
+    identity: ProcessIdentity,
+    signal: i32,
+    read: impl FnOnce(u32) -> Option<ProcessIdentity>,
+    send: impl FnOnce(u32, i32) -> io::Result<()>,
+) -> io::Result<()> {
+    if read(identity.pid) != Some(identity) {
+        return Ok(());
+    }
+    match send(identity.pid, signal) {
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        result => result,
     }
 }
 
-/// Sends SIGKILL to every signaled process that ignored SIGTERM.
-fn kill_survivors(signaled: &[SignaledProcess]) -> Result<()> {
-    for process in signaled
-        .iter()
-        .filter(|process| process_exists(process.pid))
-    {
-        let raw_pid = i32::try_from(process.pid)
-            .with_context(|| format!("Portboard cannot signal pid {}", process.pid))?;
-        let result = match &process.pidfd {
-            Some(pidfd) => pidfd.send_sigkill(),
-            None => {
-                // Old kernels without pidfds get the narrowest available
-                // fallback after the same revalidation-free grace window.
-                // SAFETY: libc::kill does not retain pointers and `raw_pid` is
-                // a validated, positive process id obtained from /proc.
-                let result = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
-                if result == 0 {
+impl SignaledProcess {
+    fn send(&self, signal: i32) -> Result<()> {
+        signal_if_current(
+            self.identity,
+            signal,
+            ProcessIdentity::read,
+            |pid, signal| {
+                if let Some(fd) = &self.pidfd {
+                    return fd.send_signal(signal);
+                }
+                // SAFETY: positive PID, exact start time checked immediately above.
+                if unsafe { libc::kill(pid as i32, signal) } == 0 {
                     Ok(())
                 } else {
                     Err(io::Error::last_os_error())
                 }
-            }
-        };
-        match result {
-            // The process exited between the liveness check and the signal.
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("Portboard could not kill pid {}", process.pid));
-            }
-        }
+            },
+        )
+        .with_context(|| format!("Portboard could not signal pid {}", self.identity.pid))
     }
-    Ok(())
 }
 
-/// Returns whether a numeric PID still names a live or zombie process.
-fn process_exists(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-fn wait_for_launch_target_to_stop(
-    worktree_root: &Path,
-    target: &LaunchTarget,
-    timeout: Duration,
-) -> Result<()> {
+fn wait_for_exit(processes: &[SignaledProcess], timeout: Duration) {
     let deadline = Instant::now() + timeout;
-    loop {
-        if find_launch_target_processes(worktree_root, target)?.is_empty() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "Portboard launch target `{}` did not stop within {} seconds",
-                target.id.as_str(),
-                timeout.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
+    while processes.iter().any(|process| process.identity.is_live()) && Instant::now() < deadline {
+        thread::sleep(KILL_POLL_INTERVAL);
     }
 }
 
@@ -223,14 +197,6 @@ impl PidFd {
             return Ok(None);
         }
         Err(error).with_context(|| format!("Portboard could not open a pidfd for pid {pid}"))
-    }
-
-    fn send_sigterm(&self) -> io::Result<()> {
-        self.send_signal(libc::SIGTERM)
-    }
-
-    fn send_sigkill(&self) -> io::Result<()> {
-        self.send_signal(libc::SIGKILL)
     }
 
     fn send_signal(&self, signal: i32) -> io::Result<()> {
@@ -272,6 +238,42 @@ mod tests {
     use crate::launch_target_config::parse_launch_target_config;
 
     use super::stop_launch_target;
+
+    #[test]
+    fn fallback_escalation_does_not_signal_reused_pid() {
+        let original = crate::process_identity::ProcessIdentity {
+            pid: 123,
+            start_time: 10,
+        };
+        let replacement = crate::process_identity::ProcessIdentity {
+            pid: 123,
+            start_time: 20,
+        };
+        let calls = std::cell::Cell::new(0);
+        super::signal_if_current(
+            original,
+            libc::SIGKILL,
+            |_| Some(replacement),
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        super::signal_if_current(
+            original,
+            libc::SIGKILL,
+            |_| Some(original),
+            |_, signal| {
+                assert_eq!(signal, libc::SIGKILL);
+                calls.set(calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn stops_a_matching_process() {

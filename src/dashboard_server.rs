@@ -5,11 +5,16 @@ use std::net::ToSocketAddrs;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    mpsc::{self, SyncSender, TrySendError},
+    Arc, Mutex,
+};
 use std::time::Duration;
 
+use crate::bounded_http::{Request, Server};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Response, StatusCode};
 
 use crate::current_workspace_status::inspect_worktree_launch_targets;
 use crate::launch_target_config::{load_worktree_launch_targets, LaunchTarget};
@@ -32,11 +37,28 @@ pub fn serve_worktree_dashboard(worktree_root: &Path, bind_address: Option<&str>
     if !is_loopback_bind_address(bind_address) {
         bail!("Portboard dashboard only binds to loopback addresses; got `{bind_address}`");
     }
-    let server = Server::http(bind_address)
+    let mut server = Server::http(bind_address)
         .map_err(|error| anyhow!("Portboard dashboard could not bind {bind_address}: {error}"))?;
     let token = request_token()?;
     let allowed_hosts = allowed_host_headers(bind_address)?;
     let mut state = DashboardState::new(worktree_root.to_path_buf())?;
+    let mut mutations = DashboardState::new(worktree_root.to_path_buf())?;
+    mutations.children = Arc::clone(&state.children);
+    let (mutation_sender, mutation_receiver) = mpsc::sync_channel(8);
+    let worker_token = token.clone();
+    let worker_hosts = allowed_hosts.clone();
+    std::thread::Builder::new()
+        .name("portboard-mutations".into())
+        .spawn(move || {
+            for request in mutation_receiver {
+                if let Err(error) =
+                    handle_request(request, &mut mutations, &worker_token, &worker_hosts, None)
+                {
+                    eprintln!("Portboard dashboard mutation failed: {error:#}");
+                }
+            }
+        })
+        .context("Portboard dashboard could not start mutation worker")?;
 
     println!("Portboard dashboard: http://{bind_address}");
     loop {
@@ -47,7 +69,13 @@ pub fn serve_worktree_dashboard(worktree_root: &Path, bind_address: Option<&str>
         else {
             continue;
         };
-        if let Err(error) = handle_request(request, &mut state, &token, &allowed_hosts) {
+        if let Err(error) = handle_request(
+            request,
+            &mut state,
+            &token,
+            &allowed_hosts,
+            Some(&mutation_sender),
+        ) {
             eprintln!("Portboard dashboard request failed: {error:#}");
         }
     }
@@ -66,6 +94,7 @@ fn handle_request(
     state: &mut DashboardState,
     token: &str,
     allowed_hosts: &[String],
+    mutation_sender: Option<&SyncSender<Request>>,
 ) -> Result<()> {
     let method = request.method().clone();
     let path = request
@@ -95,6 +124,24 @@ fn handle_request(
         );
     }
 
+    // Authorization stays on the accept thread, before bounded dispatch.
+    if method == Method::Post {
+        if let Some(sender) = mutation_sender {
+            return match sender.try_send(request) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(request) | TrySendError::Disconnected(request)) => {
+                    respond_json(
+                        request,
+                        StatusCode(503),
+                        &ApiMessage {
+                            message: "dashboard mutation queue is full or unavailable".into(),
+                        },
+                    )
+                }
+            };
+        }
+    }
+
     let response = (|| -> Result<(StatusCode, &'static str, String)> {
         match (method, path.as_str()) {
             (Method::Get, "/") => Ok((
@@ -109,7 +156,19 @@ fn handle_request(
                     .statuses
                     .iter()
                     .zip(config.launch_targets.iter())
-                    .map(|(status, _target)| DashboardTargetStatus { status })
+                    .map(|(status, _target)| DashboardTargetStatus {
+                        status,
+                        listener_urls: status
+                            .endpoints
+                            .iter()
+                            .map(|endpoint| {
+                                crate::browser_url::listener_browser_url(
+                                    &endpoint.address,
+                                    endpoint.port,
+                                )
+                            })
+                            .collect(),
+                    })
                     .collect::<Vec<_>>();
                 let status = DashboardStatus {
                     worktree_root: state.worktree_root.to_string_lossy().into_owned(),
@@ -212,7 +271,8 @@ fn content_type(value: &'static str) -> Header {
 struct DashboardState {
     worktree_root: PathBuf,
     log_directory: PathBuf,
-    children: HashMap<String, Child>,
+    children: Arc<Mutex<HashMap<String, Child>>>,
+    groups: HashMap<String, crate::process_identity::OwnedProcessGroup>,
 }
 
 impl DashboardState {
@@ -227,17 +287,22 @@ impl DashboardState {
         Ok(Self {
             worktree_root,
             log_directory,
-            children: HashMap::new(),
+            children: Arc::new(Mutex::new(HashMap::new())),
+            groups: HashMap::new(),
         })
     }
 
     fn start_target(&mut self, target_id: &str) -> Result<StartResult> {
-        if let Some(child) = self.children.get_mut(target_id) {
+        if let Some(child) = self.children.lock().unwrap().get_mut(target_id) {
             let child_running = child
                 .try_wait()
                 .context("Portboard dashboard could not read child status")?
                 .is_none();
-            if child_running || process_group_exists(child.id()) {
+            if child_running
+                || self.groups.get(target_id).is_some_and(|group| {
+                    group.members().map_or(true, |members| !members.is_empty())
+                })
+            {
                 return Ok(StartResult {
                     outcome: "already_running",
                     pid: Some(child.id()),
@@ -245,14 +310,13 @@ impl DashboardState {
                 });
             }
         }
-        self.children.remove(target_id);
+        self.children.lock().unwrap().remove(target_id);
 
         let config = load_worktree_launch_targets(&self.worktree_root)?;
         let target = find_target(&config.launch_targets, target_id)?;
         let mut launch_lock = LaunchTargetLock::acquire(&self.worktree_root, target)?;
         let existing = find_launch_target_processes(&self.worktree_root, target)?;
         if !existing.is_empty() {
-            launch_lock.clear()?;
             return Ok(StartResult {
                 outcome: "already_running",
                 pid: existing.first().map(|process| process.pid),
@@ -273,7 +337,9 @@ impl DashboardState {
             format!("Portboard dashboard could not clone {}", log_path.display())
         })?;
         let mut command = detached_command(target, &self.worktree_root);
+        let run_token = request_token()?;
         let child = command
+            .env("PORTBOARD_RUN_TOKEN", &run_token)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
@@ -286,7 +352,17 @@ impl DashboardState {
             })?;
         let pid = child.id();
         launch_lock.reserve_process(pid)?;
-        self.children.insert(target.id.as_str().to_string(), child);
+        self.groups.insert(
+            target.id.as_str().to_string(),
+            crate::process_identity::OwnedProcessGroup {
+                pgid: pid,
+                token: run_token,
+            },
+        );
+        self.children
+            .lock()
+            .unwrap()
+            .insert(target.id.as_str().to_string(), child);
         Ok(StartResult {
             outcome: "started",
             pid: Some(pid),
@@ -298,27 +374,22 @@ impl DashboardState {
         let config = load_worktree_launch_targets(&self.worktree_root)?;
         let target = find_target(&config.launch_targets, target_id)?;
 
-        if let Some(child) = self.children.get(target_id) {
-            let pid = i32::try_from(child.id())
-                .with_context(|| format!("Portboard cannot signal pid {}", child.id()))?;
-            // Dashboard children are process-group leaders (see
-            // `detached_command`), so a negative pid stops the complete run.
-            // SAFETY: libc::kill does not retain pointers and `pid` is positive.
-            let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
-            if result != 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error)
-                        .with_context(|| format!("Portboard could not stop process group {pid}"));
-                }
-            }
-            return Ok(StopResult {
-                outcome: "stopping",
-                pids: vec![pid as u32],
-            });
+        let pids = if let Some(group) = self.groups.get(target_id) {
+            crate::launch_target_stop::stop_launch_target_with_owned_group(
+                &self.worktree_root,
+                target,
+                group,
+            )?
+        } else {
+            stop_launch_target(&self.worktree_root, target)?
+        };
+        let child = self.children.lock().unwrap().remove(target_id);
+        if let Some(mut child) = child {
+            child
+                .wait()
+                .context("Portboard dashboard could not reap stopped child")?;
         }
-
-        let pids = stop_launch_target(&self.worktree_root, target)?;
+        self.groups.remove(target_id);
         Ok(StopResult {
             outcome: "stopping",
             pids,
@@ -326,25 +397,14 @@ impl DashboardState {
     }
 
     fn reap_finished_children(&mut self) {
-        self.children.retain(|_, child| match child.try_wait() {
-            Ok(Some(_)) => process_group_exists(child.id()),
-            Ok(None) => true,
-            Err(error) => {
+        // Never hold this mutex during mutation locks or shutdown. Reaped
+        // handles remain as per-target bookkeeping until start/stop replaces them.
+        for child in self.children.lock().unwrap().values_mut() {
+            if let Err(error) = child.try_wait() {
                 eprintln!("Portboard dashboard could not read child status: {error}");
-                false
             }
-        });
+        }
     }
-}
-
-#[cfg(unix)]
-fn process_group_exists(leader_pid: u32) -> bool {
-    let Ok(group_id) = i32::try_from(leader_pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 performs existence/permission checking only.
-    let result = unsafe { libc::kill(-group_id, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn detached_command(target: &LaunchTarget, worktree_root: &Path) -> Command {
@@ -354,6 +414,7 @@ fn detached_command(target: &LaunchTarget, worktree_root: &Path) -> Command {
     command
         .args(&target.argv[1..])
         .current_dir(worktree_root)
+        .env("PORTBOARD_TARGET_ID", target.id.as_str())
         .process_group(0);
     command
 }
@@ -479,6 +540,7 @@ struct DashboardStatus<'a> {
 
 #[derive(Serialize)]
 struct DashboardTargetStatus<'a> {
+    listener_urls: Vec<String>,
     #[serde(flatten)]
     status: &'a crate::current_workspace_status::CurrentLaunchTargetStatus,
 }
@@ -536,14 +598,14 @@ async function api(path, options = {{}}) {{
 async function refresh() {{
   try {{
     const data = await api('/api/status');
-    errorBox.textContent = '';
+    errorBox.textContent = (data.findings || []).join('\n');
     targetList.replaceChildren(...data.targets.map(target => {{
       const row = document.createElement('section'); row.className = 'target';
       const label = document.createElement('strong'); label.textContent = target.label;
       const state = document.createElement('span'); state.className = 'state';
       const endpoints = target.named_endpoints.length
         ? target.named_endpoints.map(endpoint => `${{endpoint.id}} ${{endpoint.url}}`).join(', ')
-        : target.endpoints.map(endpoint => `${{endpoint.address}}:${{endpoint.port}}`).join(', ');
+        : target.listener_urls.join(', ');
       const detail = endpoints ? `${{target.state}} · ${{endpoints}}` : target.state;
       if (target.duplicate) {{
         state.style.color = '#ff8f8f';
@@ -578,6 +640,34 @@ mod tests {
     use std::path::Path;
 
     use super::{is_loopback_bind_address, rotate_log};
+
+    #[test]
+    fn owned_stop_confirms_term_ignoring_child_exit() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("portboard.toml"),
+            r#"version = 1
+[[launch_targets]]
+id = "probe"
+label = "Probe"
+argv = ["bash", "-c", "trap '' TERM; exec sleep 30"]
+"#,
+        )
+        .unwrap();
+        let mut state = super::DashboardState::new(root.path().to_path_buf()).unwrap();
+        let pid = state.start_target("probe").unwrap().pid.unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        state.stop_target("probe").unwrap();
+        let exited = crate::process_identity::ProcessIdentity::read(pid).is_none();
+        if let Some(child) = state.children.lock().unwrap().get_mut("probe") {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "dashboard stop must confirm exit, not just send TERM"
+        );
+    }
 
     #[test]
     fn only_accepts_loopback_dashboard_addresses() {
